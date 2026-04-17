@@ -1,5 +1,7 @@
 # BERT-base Positional Artifact Reproduction
 
+**Author:** EL ABDOUNI Hamza
+
 This project reproduces the BERT-base parts of:
 
 `Positional Artefacts Propagate Through Masked Language Model Embeddings`
