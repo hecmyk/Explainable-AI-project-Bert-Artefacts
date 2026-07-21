@@ -1,0 +1,2109 @@
+import json
+import logging
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from pipeline import process_pipeline
+from agent import run_agent
+
+
+logger = logging.getLogger(__name__)
+
+
+def run_document(pdf_path: str | Path, output_path: str | Path,
+                 task_instruction: str, output_schema: dict[str, Any],
+                 field_definitions: dict[str, str],
+                 save_intermediate: bool = False,
+                 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one document end-to-end: preprocessing then agentic extraction.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        output_path: Directory passed to the pipeline for its work folder.
+        task_instruction: Extraction instruction handed to the agent.
+        output_schema: JSON schema describing the fields to extract.
+        field_definitions: Mapping from field name to its definition text.
+        save_intermediate: Keep the pipeline's intermediate work folder.
+
+    Returns:
+        `(record, result)`: `record` holds per-document metrics, `result` is the
+        agent's extraction.
+    """
+    pdf_path = Path(pdf_path)
+    doc_id = pdf_path.stem
+    doc_dir = pdf_path.parent
+
+    t0 = time.perf_counter()
+    markdown_str, id_to_bbox, doc_ocr, _ = process_pipeline(
+        pdf_path, output_path, save_intermediate=save_intermediate)
+    preprocessing_time_s = round(time.perf_counter() - t0, 2)
+
+    # Permanent preprocessing deliverables in the document's folder (survive the
+    # rmtree of work). markdown_str, id_to_bbox and doc_ocr are already produced by process_pipeline.
+    (doc_dir / f"{doc_id}_markdown.md").write_text(markdown_str, encoding="utf-8")
+    with open(doc_dir / f"{doc_id}_ocr.json", "w", encoding="utf-8") as f:
+        json.dump(doc_ocr, f, indent=2, ensure_ascii=False)
+    with open(doc_dir / f"{doc_id}_id_to_bbox.json", "w", encoding="utf-8") as f:
+        json.dump(id_to_bbox, f, indent=2, ensure_ascii=False)
+
+    result, agent_metrics = run_agent(
+        task_instruction, output_schema, markdown_str, id_to_bbox, pdf_path,
+        field_definitions)
+
+    record = {
+        "doc_id": doc_id,
+        "n_pages": len(doc_ocr),
+        "preprocessing_time_s": preprocessing_time_s,
+        "agent": agent_metrics,
+        "total_time_s": round(preprocessing_time_s + agent_metrics["agent_time_s"], 2),
+    }
+
+    # Agent output (permanent deliverable), same folder.
+    with open(doc_dir / f"{doc_id}_agent.json", "w", encoding="utf-8") as f:
+        json.dump({**record, "result": result}, f, indent=2, ensure_ascii=False)
+
+    return record, result
+
+
+def run_documents(docs: Sequence[str | Path], output_path: str | Path,
+                  task_instruction: str, output_schema: dict[str, Any],
+                  field_definitions: dict[str, str], runs_path: str | Path | None = None,
+                  save_intermediate: bool = False,
+                  ) -> list[dict[str, Any]]:
+    """Run a batch of documents and serialize the aggregated results to JSON.
+
+    Args:
+        docs: PDF paths to process.
+        output_path: Directory passed to the pipeline for its work folder.
+        task_instruction: Extraction instruction shared across all documents.
+        output_schema: JSON schema describing the fields to extract.
+        field_definitions: Mapping from field name to its definition text.
+        runs_path: Destination JSON path; defaults to `output_path/agent_runs.json`.
+        save_intermediate: Keep each pipeline's intermediate work folder.
+
+    Returns:
+        One entry per document, each `{**record, "result": ...}`, or
+        `{doc_id, error, result: None}` when the document failed.
+    """
+    entries = []
+    for pdf in docs:
+        try:
+            record, result = run_document(pdf, output_path, task_instruction,
+                                          output_schema, field_definitions,
+                                          save_intermediate=save_intermediate)
+            entries.append({**record, "result": result})
+        except Exception as e:
+            # Un document qui plante ne doit pas faire échouer toute la batch : on log
+            # l'exception (stack incluse) et on passe au suivant.
+            logger.exception(f"run_document failed for {pdf}")
+            entries.append({
+                "doc_id": Path(pdf).stem,
+                "error": str(e),
+                "result": None,
+            })
+
+    if runs_path is None:
+        runs_path = Path(output_path) / "agent_runs.json"
+    runs_path = Path(runs_path)
+    runs_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(runs_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2, ensure_ascii=False)
+
+    return entries
+
+
+
+
+AGENT.PY
+
+import json
+import time
+from collections import Counter
+from collections.abc import Sequence
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+from openai import OpenAI
+
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+from tools import get_crop, get_page
+
+
+client = OpenAI(
+    base_url=MISTRAL_BASE_URL,
+    api_key=MISTRAL_API_KEY,
+)
+MODEL = MISTRAL_AGENT_MODEL
+
+
+# --------------------------------------------------------------------------- #
+# Prompts                                                                      #
+# --------------------------------------------------------------------------- #
+SYSTEM_PROMPT_PHASE1 = (
+    "You extract structured fields from a document provided as markdown (OCR text).\n"
+    "Extract every field you can directly from the markdown text.\n"
+    "Pages are delimited by '### Start Page N ###' and '### End Page ###' markers and "
+    "are 0-indexed: the first page is page 0. The page_num field in submit_draft MUST "
+    "match this 0-indexed marker, NOT any page number that may appear inside the page "
+    "content itself (footers, headers, 'Page X of Y' mentions). Trust the marker, not "
+    "the OCR'd content.\n"
+    "Tools — use ONLY when the markdown text is insufficient:\n"
+    "  - get_crop(item_id): a value lives in a table/figure whose transcription looks "
+    "corrupted or unreadable. Valid ids appear as [TABLE id=...] / [FIGURE id=...].\n"
+    "  - get_page(page_index): you need a page's visual/spatial context. Use the "
+    "0-indexed page number from the '### Start Page N ###' marker.\n"
+    "Do NOT call a tool when the text already gives the answer.\n"
+    "Keep values and citations in the document's original language — never translate.\n"
+    "When you are done, you MUST finish by calling submit_draft with all fields. For each "
+    "field set source='text' if you read the value in the markdown, or source='visual' if "
+    "you read it from a tool image. Use null for value/citation/page_num when a field is "
+    "absent from the document."
+)
+
+SYSTEM_PROMPT_PHASE2 = (
+    "You receive the rendered image of ONE document page, the definitions of the fields to "
+    "verify on this page, and the values that were extracted for them from the OCR text.\n"
+    "Most extracted values are already correct: keep a value unchanged unless the image "
+    "clearly contradicts it. When in doubt, keep the extracted value.\n"
+    "For each field, use the provided citation ONLY to locate the relevant zone on the image "
+    "— it tells you WHERE to look, not WHAT the value is, because the OCR text may be silently "
+    "corrupted. Read the value from the image at that location and compare it with the "
+    "extracted value; correct it only to match what the pixels actually show.\n"
+    "Do NOT change the scope of a field: never shorten or extend it beyond what its definition "
+    "asks, and never replace its value with one taken from a different zone or a neighbouring "
+    "field. Verify each field strictly against its own definition.\n"
+    "Keep citations in the document's original language — never translate. "
+    "Finish by calling submit_page_corrections with the fields for this page."
+)
+
+
+# --------------------------------------------------------------------------- #
+# Tool definitions                                                             #
+# --------------------------------------------------------------------------- #
+READ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_page",
+            "description": (
+                "Retrieve the full rendered image of a page, for visual/spatial context "
+                "or to read a figure in its surroundings."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_index": {
+                        "type": "integer",
+                        "description": "Page number, as shown in the markdown by '### Start Page N ###'.",
+                    },
+                },
+                "required": ["page_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_crop",
+            "description": (
+                "Retrieve a close-up image of a specific table/figure when its "
+                "transcription looks wrong or unreadable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "Element id in the form pX_eY, as shown by [TABLE id=...] / [FIGURE id=...].",
+                    },
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+]
+
+
+def _draft_field_schema() -> dict[str, Any]:
+    """Return the JSON schema for one draft field (per-field schema plus `source`)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "value": {"type": ["string", "null"]},
+            "citation": {"type": ["string", "null"]},
+            "page_num": {"type": ["array", "null"], "items": {"type": "integer"}},
+            "source": {"type": "string", "enum": ["text", "visual"]},
+        },
+        "required": ["value", "citation", "page_num", "source"],
+    }
+
+
+def _correction_field_schema() -> dict[str, Any]:
+    """Return the JSON schema for one phase-2 correction field (draft keys minus `source`)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "value": {"type": ["string", "null"]},
+            "citation": {"type": ["string", "null"]},
+            "page_num": {"type": ["array", "null"], "items": {"type": "integer"}},
+        },
+        "required": ["value", "citation", "page_num"],
+    }
+
+
+def _build_submit_draft_tool(field_names: Sequence[str]) -> dict[str, Any]:
+    """Build the phase-1 `submit_draft` finish-tool for the expected fields.
+
+    Args:
+        field_names: Names of the fields to extract.
+
+    Returns:
+        An OpenAI tool definition.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_draft",
+            "description": "Submit the extracted draft for all fields. Call this exactly once when extraction is complete.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {f: _draft_field_schema() for f in field_names},
+                "required": list(field_names),
+            },
+        },
+    }
+
+
+def _build_submit_page_corrections_tool(field_names: Sequence[str]) -> dict[str, Any]:
+    """Build the phase-2 `submit_page_corrections` finish-tool for the expected fields.
+
+    The corrections object is non-strict: the agent may omit fields it has no opinion on.
+
+    Args:
+        field_names: Names of the fields to verify.
+
+    Returns:
+        An OpenAI tool definition.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_page_corrections",
+            "description": "Submit verified/corrected fields for the current page. Omit a field only if you truly have no opinion on it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "corrections": {
+                        "type": "object",
+                        "properties": {f: _correction_field_schema() for f in field_names},
+                    },
+                },
+                "required": ["corrections"],
+            },
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers                                                              #
+# --------------------------------------------------------------------------- #
+def _safe_args(tc: Any) -> dict[str, Any]:
+    """Return a tool call's arguments as a dict, never raising (schema not guaranteed)."""
+    try:
+        args = json.loads(tc.function.arguments or "{}")
+        return args if isinstance(args, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _norm_page_num(v: Any) -> list[int] | None:
+    """Normalize a model-returned page_num into a list of ints, or None."""
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, list):
+        out = [int(x) for x in v if isinstance(x, (int, float, str)) and str(x).lstrip("-").isdigit()]
+        return out or None
+    return None
+
+
+def _norm_value(v: Any) -> str:
+    """Normalize a value for draft-vs-final comparison: None and whitespace collapse to ''."""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _normalize_draft(args: dict[str, Any], field_names: Sequence[str],
+                     ) -> dict[str, dict[str, Any]]:
+    """Coerce raw tool arguments into the canonical draft shape (the tool schema is only advisory).
+
+    Args:
+        args: Raw arguments from the submit_draft tool call.
+        field_names: Names of the fields to extract.
+
+    Returns:
+        Draft mapping each field to `value`, `citation`, `page_num` and `source`.
+    """
+    draft = {}
+    for f in field_names:
+        sub = args.get(f) if isinstance(args.get(f), dict) else {}
+        src = sub.get("source")
+        draft[f] = {
+            "value": sub.get("value"),
+            "citation": sub.get("citation"),
+            "page_num": _norm_page_num(sub.get("page_num")),
+            "source": src if src in ("text", "visual") else "text",
+        }
+    return draft
+
+
+def _salvage_submit_draft_from_text(content: str | None, field_names: Sequence[str],
+                                    ) -> dict[str, dict[str, Any]] | None:
+    """Recover a submit_draft payload emitted as text in `content`, or None.
+
+    Args:
+        content: Assistant message text that may embed the submit_draft JSON.
+        field_names: Names of the fields to extract.
+
+    Returns:
+        The normalized draft, or None when nothing valid is found.
+    """
+    # submit_draft parfois émis en texte dans content (bug tool-calling Mistral/vLLM) :
+    # on parse le JSON qui suit le token ; json.loads valide (texte après -> échec propre).
+    if not content or "submit_draft" not in content:
+        return None
+    start = content.find("{", content.find("submit_draft"))
+    if start == -1:
+        return None
+    try:
+        parsed = json.loads(content[start:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not (set(parsed) & set(field_names)):
+        return None
+    return _normalize_draft(parsed, field_names)
+
+
+def _salvage_read_tool_from_text(content: str | None) -> tuple[str, dict[str, Any]] | None:
+    """Recover a get_page/get_crop call emitted as text in `content`.
+
+    Args:
+        content: Assistant message text that may embed the tool call.
+
+    Returns:
+        `(tool_name, args)` for the first read-tool found, or None.
+    """
+    if not content:
+        return None
+    hits = [(content.find(n), n) for n in ("get_page", "get_crop") if n in content]
+    if not hits:
+        return None
+    i, name = min(hits)
+    start = content.find("{", i)
+    if start == -1:
+        return None
+    try:
+        args = json.loads(content[start:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    return name, args
+
+
+# --------------------------------------------------------------------------- #
+# run_agent                                                                    #
+# --------------------------------------------------------------------------- #
+def run_agent(task_instruction: str, output_schema: dict[str, Any], markdown_str: str,
+              id_to_bbox: dict[str, tuple[int, list[int]]], pdf_path: str | Path,
+              field_definitions: dict[str, str], model: str = MODEL,
+              max_steps: int = 6) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract structured fields from a document in three phases.
+
+    Phase 1 agentically drafts the fields from the markdown (with get_page/get_crop),
+    ending on the submit_draft finish-tool. Phase 2 verifies each text-sourced field
+    against its page image and merges corrections deterministically. Phase 3 projects
+    the consolidated draft onto `output_schema` with no further LLM call.
+
+    Args:
+        task_instruction: Extraction instruction appended to the markdown.
+        output_schema: JSON schema whose `properties` are the fields to extract.
+        markdown_str: OCR markdown of the document.
+        id_to_bbox: Mapping from atom ID to `(page_index, [x1, y1, x2, y2])`.
+        pdf_path: Path to the source PDF.
+        field_definitions: Mapping from field name to its definition text.
+        model: Chat model id.
+        max_steps: Maximum phase-1 agent turns before forcing submit_draft.
+
+    Returns:
+        `(result, metrics)`: `result` maps each field to `value`/`citation`/`page_num`,
+        `metrics` holds timing, token and tool-call stats.
+    """
+    t0 = time.perf_counter()
+    field_names = list(output_schema["properties"])
+
+    tool_calls_by_type = Counter()
+    tool_log = []
+    n_turns = 0
+    hit_max_iterations = False
+    phase_times = {"phase1": 0.0, "phase2": 0.0}
+    phase_tokens = {p: {"prompt": 0, "completion": 0, "total": 0}
+                    for p in ("phase1", "phase2")}
+    tokens = {"prompt": 0, "completion": 0, "total": 0}
+
+    def _add_usage(response: Any, phase: str) -> None:
+        """Accumulate an LLM call's token usage into the phase bucket and the global total."""
+        usage = getattr(response, "usage", None)
+        p = getattr(usage, "prompt_tokens", 0) or 0
+        c = getattr(usage, "completion_tokens", 0) or 0
+        tot = getattr(usage, "total_tokens", 0) or 0
+        for bucket in (phase_tokens[phase], tokens):
+            bucket["prompt"] += p
+            bucket["completion"] += c
+            bucket["total"] += tot
+
+    submit_draft_tool = _build_submit_draft_tool(field_names)
+    submit_corr_tool = _build_submit_page_corrections_tool(field_names)
+    phase1_tools = READ_TOOLS + [submit_draft_tool]
+
+    # ----------------------------- Phase 1 --------------------------------- #
+    p1_start = time.perf_counter()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_PHASE1},
+        {"role": "user", "content": f"{markdown_str}\n\n{task_instruction}"},
+    ]
+
+    def _extract_submit_draft(message: Any) -> dict[str, dict[str, Any]] | None:
+        """Return the normalized draft if `message` carries the submit_draft finish-call, else None."""
+        for tc in (message.tool_calls or []):
+            if tc.function.name == "submit_draft":
+                return _normalize_draft(_safe_args(tc), field_names)
+        return None
+
+    draft = None
+    for _ in range(max_steps):
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model, messages=messages, tools=phase1_tools,
+        )
+        _add_usage(response, "phase1")
+        message = response.choices[0].message
+
+        if not message.tool_calls:
+            # Le modèle s'arrête sans tool_call structuré : submit_draft est parfois émis
+            # comme TEXTE dans content (bug tool-calling Mistral/vLLM). On le salvage
+            # directement, sans relancer en forçant submit_draft : ce retry repartait d'un
+            # `messages` amnésique (le tour assistant n'y est jamais ajouté, cf. le 400),
+            # donc le modèle re-décidait de zéro et pouvait écraser un payload déjà valide.
+            # Si rien n'est récupérable ici, le fallback post-boucle rejoue de toute façon
+            # l'appel forcé (requête identique) avant de lever.
+            draft = _salvage_submit_draft_from_text(message.content, field_names)
+            if draft is not None:
+                tool_calls_by_type["submit_draft (text-recovered)"] += 1
+                tool_log.append({"turn": n_turns,
+                                 "tool": "submit_draft (text-recovered)",
+                                 "args": "<draft>"})
+                break
+
+            # get_page/get_crop peuvent aussi sortir en texte. Ici c'est une ACTION, pas une
+            # finish-tool : on l'exécute réellement et on réinjecte l'image par le canal user
+            # (qui ne demande aucun tool_call_id), puis on poursuit la boucle. Le modèle
+            # obtient ce qu'il demandait au lieu de crasher.
+            salvaged = _salvage_read_tool_from_text(message.content)
+            if salvaged is None:
+                break
+            name, args = salvaged
+            tool_calls_by_type[f"{name} (text-recovered)"] += 1
+            tool_log.append({"turn": n_turns, "tool": f"{name} (text-recovered)",
+                             "args": args})
+
+            b64 = None
+            if name == "get_page":
+                try:
+                    b64 = get_page(pdf_path, args["page_index"])
+                    ack = f"image returned for page {args.get('page_index')}"
+                except (KeyError, IndexError):
+                    ack = f"invalid page_index {args.get('page_index')!r}"
+            else:
+                try:
+                    b64 = get_crop(args["item_id"], id_to_bbox, pdf_path)
+                    ack = f"image returned for {args.get('item_id')}"
+                except KeyError:
+                    ack = (f"unknown id {args.get('item_id')!r} — valid ids appear in the "
+                           "markdown as [TABLE id=...] / [FIGURE id=...]")
+
+            # Tour assistant (texte) puis message user : alternance propre, pas de tool_calls
+            # orphelin, et on ne finit pas sur un tour assistant (cf. le 400).
+            messages.append({"role": "assistant", "content": message.content})
+            parts = [{"type": "text", "text": f"{ack}:" if b64 is not None else ack}]
+            if b64 is not None:
+                parts.append({"type": "image_url",
+                              "image_url": {"url": f"data:image/png;base64,{b64}"}})
+            messages.append({"role": "user", "content": parts})
+            continue
+
+        # Si submit_draft est présent (même en parallèle d'autres), on termine.
+        draft = _extract_submit_draft(message)
+        if draft is not None:
+            tool_calls_by_type["submit_draft"] += 1
+            tool_log.append({"turn": n_turns, "tool": "submit_draft", "args": "<draft>"})
+            break
+
+        # Sinon : on rejoue les outils de lecture. Tous les acks role='tool' d'abord,
+        # puis UN message user avec libellé + image par appel (association lisible).
+        messages.append(message.model_dump(exclude_none=True))
+        image_parts = []
+        for tc in message.tool_calls:
+            args = _safe_args(tc)
+            tool_calls_by_type[tc.function.name] += 1
+            tool_log.append({"turn": n_turns, "tool": tc.function.name, "args": args})
+
+            b64 = None
+            if tc.function.name == "get_page":
+                try:
+                    b64 = get_page(pdf_path, args["page_index"])
+                    ack = f"image returned for page {args.get('page_index')}"
+                except (KeyError, IndexError):
+                    ack = f"invalid page_index {args.get('page_index')!r}"
+            elif tc.function.name == "get_crop":
+                try:
+                    b64 = get_crop(args["item_id"], id_to_bbox, pdf_path)
+                    ack = f"image returned for {args.get('item_id')}"
+                except KeyError:
+                    ack = (f"unknown id {args.get('item_id')!r} — valid ids appear in the "
+                           "markdown as [TABLE id=...] / [FIGURE id=...]")
+            else:
+                ack = f"unknown tool {tc.function.name!r}"
+
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": ack})
+            if b64 is not None:
+                image_parts.append({"type": "text", "text": ack + ":"})
+                image_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+        if image_parts:
+            messages.append({"role": "user", "content": image_parts})
+
+    # Plafond atteint sans brouillon : un dernier appel forcé sur submit_draft.
+    # Robustesse endpoint : on n'expose QUE submit_draft (liste à 1 outil) en plus du
+    # named-forcing. Si le shim refuse le named form, remplacer tool_choice par "required".
+    if draft is None:
+        hit_max_iterations = True
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=[submit_draft_tool],
+            tool_choice={"type": "function", "function": {"name": "submit_draft"}},
+        )
+        _add_usage(response, "phase1")
+        message = response.choices[0].message
+        draft = _extract_submit_draft(message)
+        if draft is not None:
+            tool_calls_by_type["submit_draft"] += 1
+            tool_log.append({"turn": n_turns, "tool": "submit_draft (forced)", "args": "<draft>"})
+        else:
+            draft = _salvage_submit_draft_from_text(message.content, field_names)
+            if draft is not None:
+                tool_calls_by_type["submit_draft (text-recovered)"] += 1
+                tool_log.append({"turn": n_turns,
+                                 "tool": "submit_draft (text-recovered)",
+                                 "args": "<draft>"})
+        if draft is None:
+            raise RuntimeError(
+                "phase 1 failed to produce a draft after max_steps; "
+                f"last message content={message.content!r} "
+                f"tool_calls={message.tool_calls!r}"
+            )
+
+    phase_times["phase1"] = round(time.perf_counter() - p1_start, 2)
+
+    # ----------------------------- Phase 2 --------------------------------- #
+    # Pages distinctes citées par des items source='text' avec un page_num non nul.
+    # Convention 0-based dans tout le pipeline : page_num du brouillon -> get_page direct.
+    final_draft = deepcopy(draft)
+    pages_to_verify = sorted({
+        p
+        for f in field_names
+        if draft[f]["source"] == "text" and draft[f]["page_num"]
+        for p in draft[f]["page_num"]
+    })
+
+    p2_start = time.perf_counter()
+    n_pages_verified = 0
+    for page in pages_to_verify:
+        items = {f: draft[f] for f in field_names
+                 if draft[f]["source"] == "text" and draft[f]["page_num"]
+                 and page in draft[f]["page_num"]}
+        if not items:
+            continue
+        try:
+            b64 = get_page(pdf_path, page)
+        except (KeyError, IndexError):
+            continue
+
+        desc = json.dumps(
+            {f: {"value": v["value"], "citation": v["citation"], "page_num": v["page_num"]}
+             for f, v in items.items()},
+            ensure_ascii=False, indent=2,
+        )
+        defs_lines = [f"- {f}: {field_definitions[f]}" for f in items if f in field_definitions]
+        defs_block = "\n".join(defs_lines)
+        text_payload = (
+            f"Field definitions:\n{defs_block}\n\n"
+            f"Values extracted from this page (page {page}):\n{desc}"
+        )
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_PHASE2},
+                {"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text",
+                     "text": text_payload},
+                ]},
+            ],
+            tools=[submit_corr_tool],
+            tool_choice={"type": "function", "function": {"name": "submit_page_corrections"}},
+        )
+        _add_usage(response, "phase2")
+        n_pages_verified += 1
+
+        corr_tc = next((tc for tc in (response.choices[0].message.tool_calls or [])
+                        if tc.function.name == "submit_page_corrections"), None)
+        if corr_tc is None:
+            continue
+        corrections = _safe_args(corr_tc).get("corrections", {})
+        if not isinstance(corrections, dict):
+            continue
+
+        # Merge déterministe : item présent sur 2 pages -> last-write-wins (par ordre
+        # de page croissant), visible dans la trace via final_value.
+        for f, c in corrections.items():
+            if f not in field_names or not isinstance(c, dict):
+                continue
+            # value/citation ne sont écrasés que si la clé est réellement présente :
+            # une clé absente renvoyait None avec c.get() et effaçait une valeur correcte.
+            if "value" in c:
+                final_draft[f]["value"] = c["value"]
+            if "citation" in c:
+                final_draft[f]["citation"] = c["citation"]
+            final_draft[f]["page_num"] = _norm_page_num(c.get("page_num")) or draft[f]["page_num"]
+            final_draft[f]["source"] = draft[f]["source"]
+        tool_calls_by_type["submit_page_corrections"] += 1
+        tool_log.append({"turn": n_turns, "tool": "submit_page_corrections",
+                         "args": {"page": page, "fields": list(corrections)}})
+
+    phase_times["phase2"] = round(time.perf_counter() - p2_start, 2)
+
+    # Trace des corrections (la métrique qui justifie la phase 2).
+    verified_pages_by_field = {
+        f: (draft[f]["page_num"] or []) if draft[f]["source"] == "text" else []
+        for f in field_names
+    }
+    corrections_trace = {}
+    n_corrections = 0
+    for f in field_names:
+        dv, fv = draft[f]["value"], final_draft[f]["value"]
+        corrected = _norm_value(dv) != _norm_value(fv)
+        n_corrections += int(corrected)
+        corrections_trace[f] = {
+            "draft_value": dv,
+            "final_value": fv,
+            "source": draft[f]["source"],
+            "corrected": corrected,
+            "verified_on_pages": verified_pages_by_field[f] if n_pages_verified else [],
+        }
+
+    # ----------------------------- Phase 3 --------------------------------- #
+    # Synthèse déterministe : projection du brouillon consolidé sur output_schema
+    # (drop de 'source'). Aucun appel LLM ici -> pas de tokens ni de temps de phase 3
+    # reportés dans metrics (ce serait du bruit à zéro).
+    result = {f: {"value": final_draft[f]["value"],
+                  "citation": final_draft[f]["citation"],
+                  "page_num": final_draft[f]["page_num"]} for f in field_names}
+
+    metrics = {
+        "tool_calls_total": sum(tool_calls_by_type.values()),
+        "tool_calls_by_type": tool_calls_by_type,
+        "tool_log": tool_log,
+        "n_turns": n_turns,
+        "hit_max_iterations": hit_max_iterations,
+        "agent_time_s": round(time.perf_counter() - t0, 2),
+        "tokens": tokens,
+        "phase1_time_s": phase_times["phase1"],
+        "phase2_time_s": phase_times["phase2"],
+        "phase1_tokens": phase_tokens["phase1"],
+        "phase2_tokens": phase_tokens["phase2"],
+        "n_pages_verified": n_pages_verified,
+        "n_corrections": n_corrections,
+        "corrections_trace": corrections_trace,
+    }
+    return result, metrics
+
+
+
+
+
+
+
+CONFIG 
+
+
+import os
+from pathlib import Path
+
+# Paths
+DATA_RAW = Path("data/raw")
+
+# Layout — PP-DocLayoutV2 model (run + output conversion -> dict)
+LABELS = [ "abstract",
+        "algorithm",
+        "aside_text",
+        "chart",
+        "content",
+        "display_formula",
+        "doc_title",
+        "figure_title",
+        "footer",
+        "footer_image",
+        "footnote",
+        "formula_number",
+        "header",
+        "header_image",
+        "image",
+        "inline_formula",
+        "number",
+        "paragraph_title",
+        "reference",
+        "reference_content",
+        "seal",
+        "table",
+        "text",
+        "vertical_text",
+        "vision_footnote"]
+SCORE_THRESHOLD = 0.3  # minimum score to keep a detection
+
+# Phase A — cleanup thresholds
+IOA_INTRA_CLASS    = 0.80   # A1 — intra-class containment
+IOU_INTER_CONFLICT = 0.95   # A2 — inter-class conflict
+IOA_INTER_CONTAIN  = 0.80   # A3 — inter-class containment
+
+# A2 — inter-class priority ranking: lower index = higher priority
+# (table > image/chart > titles/content > text)
+CLASS_PRIORITY = {
+    "table": 0,
+    "image": 1, "chart": 1,
+    "doc_title": 2, "paragraph_title": 2, "figure_title": 2, "content": 2,
+    "text": 3,
+}
+
+# A3 — containers and protected elements
+CONTAINERS = {"table", "image", "chart", "content"}
+PROTECTED  = {"figure_title", "footnote", "vision_footnote"}
+
+# Phase B — stacking + Mistral
+DPI                     = 150   # page rasterization
+MISTRAL_MAX_CONCURRENCY = 8     # global cap on concurrent Mistral calls
+MAX_WORKERS             = 4     # threads per pool
+STACK_RATIO_TARGET      = 2.2   # target height/width ratio of a stacked image; beyond it,
+                                # the page is partitioned into sub-images (1 OCR call / sub-image)
+
+# Mistral endpoints & models (centralized; base_url/api_key overridable via env)
+MISTRAL_BASE_URL = os.environ.get(
+    "MISTRAL_BASE_URL",
+    "http://datacamp-llm-api.datacamp-llm-api-production/v1/openai",
+)
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "None")
+MISTRAL_AGENT_MODEL = "mistral-medium-3.5"
+MISTRAL_OCR_MODEL = "mistral-ocr-2512-ITG"
+MISTRAL_OCR_URL = "intern ..."
+
+# Markdown build — routing by label (to fill in from the 25 labels)
+TITLE_LABELS  = {"paragraph_title", "doc_title", "figure_title" }   # -> "# {text}"
+TABLE_LABELS  = {"table"}   # -> [TABLE id=...] + text
+FIGURE_LABELS = { "chart" , "image" }   # -> [FIGURE id=...] (+ text if present)  (figure/chart/image)
+
+
+# ---------------------------------------------------------------------------
+# Phase C — DOM builder: label -> role routing over the 25 PP-DocLayoutV2 labels.
+# The three ROLE sets (content / visual / chrome) are mutually exclusive and cover
+# the 25 labels exactly once. TITLE / CAPTION are orthogonal sub-flags used by the
+# section grouping (lot 2); they do NOT define a role. "figure" is kept in
+# DOM_VISUAL_LABELS defensively (not emitted by PP-DocLayoutV2 v1, reserved for a
+# future version); no v1 atom carries it. figure_title is both a TITLE and a CAPTION
+# candidate: the runtime decides by dim7 proximity to a visual atom (lot 2). footnote
+# is CHROME by role but also a CAPTION candidate (lot 2).
+# ---------------------------------------------------------------------------
+DOM_CONTENT_LABELS = {
+    "doc_title", "paragraph_title", "figure_title",
+    "text", "abstract", "content",
+    "reference", "reference_content",
+    "aside_text", "algorithm",
+    "display_formula", "inline_formula", "formula_number",
+    "vertical_text",
+}
+DOM_VISUAL_LABELS = {"table", "chart", "figure", "image"}
+DOM_CHROME_LABELS = {
+    "header", "footer", "header_image", "footer_image",
+    "number", "footnote", "vision_footnote", "seal",
+}
+DOM_TITLE_LABELS = {"doc_title", "paragraph_title", "figure_title"}
+DOM_CAPTION_LABELS = {"figure_title", "footnote"}
+
+
+
+
+LAYOUT.PY 
+
+
+import fitz
+import numpy as np
+import cv2
+import json
+import logging
+import paddle.inference as pdi
+from pathlib import Path
+
+from config import (
+    LABELS,
+    SCORE_THRESHOLD,
+    IOA_INTRA_CLASS,
+    IOU_INTER_CONFLICT,
+    IOA_INTER_CONTAIN,
+    CLASS_PRIORITY,
+    CONTAINERS,
+    PROTECTED,
+)
+from pdf_utils import rasterize_page
+
+
+logger = logging.getLogger(__name__)
+
+
+### load the model
+
+def load_predictor() -> pdi.Predictor:
+    """Load the PP-DocLayoutV2 model and return its inference predictor.
+
+    Returns:
+        The initialized predictor (instantiated once, at module level).
+    """
+    config = pdi.config("PP-DocLayoutV2/inference.pdmodel", "PP-DocLayoutV2/inference.pdiparams")
+
+    config.disable_gpu()
+
+    config.switch_ir_optim(False)
+    config.set_cpu_math_library_num_threads(4)
+
+    predictor = pdi.create_predictor(config)
+
+    logger.info("model loaded")
+    return predictor
+
+
+# Model loaded once, at module level.
+predictor = load_predictor()
+
+def preprocess_page(page: fitz.Page, dpi: int = 150) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Rasterize a page and format it as the layout model's input tensors.
+
+    Args:
+        page: Source page to preprocess.
+        dpi: Rendering resolution used to rasterize the page.
+
+    Returns:
+        `(x, im_shape, scale_factor, original_img)` — the model input tensor, its
+        shape, the scale factors, and the original rasterized image.
+    """
+    original_img = rasterize_page(page, dpi)
+
+    h, w = original_img.shape[:2]
+
+    img = cv2.resize(original_img, (800, 800))
+
+    x = img.astype(np.float32) / 255.0
+    x = x.transpose(2, 0, 1)
+    x = np.expand_dims(x, axis=0)
+
+    im_shape = np.array([[800, 800]], dtype=np.float32)
+
+    scale_factor = np.array(
+        [[800 / h, 800 / w]],
+        dtype=np.float32
+    )
+
+    return x, im_shape, scale_factor, original_img
+
+
+
+def run_inference(predictor: pdi.Predictor, x: np.ndarray, im_shape: np.ndarray,
+                  scale_factor: np.ndarray) -> np.ndarray:
+    """Run the layout model on a prepared page and return the raw detections.
+
+    Args:
+        predictor: PP-DocLayoutV2 predictor from load_predictor.
+        x: Model input tensor.
+        im_shape: Input image shape tensor.
+        scale_factor: Scale-factor tensor mapping model space back to pixels.
+
+    Returns:
+        Raw detection array `(N, 8)`: class, score, box, and dim7/dim8 columns per row.
+    """
+
+    predictor.get_input_handle(
+        "image"
+    ).copy_from_cpu(x)
+
+    predictor.get_input_handle(
+        "im_shape"
+    ).copy_from_cpu(im_shape)
+
+    predictor.get_input_handle(
+        "scale_factor"
+    ).copy_from_cpu(scale_factor)
+
+    predictor.run()
+
+    return predictor.get_output_handle(
+        predictor.get_output_names()[0]
+    ).copy_to_cpu()
+
+def save_layout_result(image: np.ndarray, detections: np.ndarray, labels: list[str],
+                       output_path: str | Path | None = None,
+                       score_threshold: float = SCORE_THRESHOLD,
+                       save_image: bool = False) -> tuple[int, list[dict]]:
+    """Convert raw model output into scored, sorted page detections.
+
+    Args:
+        image: Rasterized page the detections were computed on.
+        detections: Raw detection array from run_inference.
+        labels: Class-index-to-label list.
+        output_path: Where to write the annotated image (only if save_image).
+        score_threshold: Minimum score to keep a detection.
+        save_image: Draw boxes + labels and write the annotated image.
+
+    Returns:
+        `(bbox_count, page_results)`; each result is `{label, score, box, dim7, dim8}`.
+    """
+
+    if save_image:
+        img = image.copy()
+
+    bbox_count = 0
+    page_results = []
+    for det in detections:
+
+        score = float(det[1])
+
+        if score < score_threshold:
+            continue
+
+        bbox_count += 1
+
+        class_id = int(det[0])
+
+        label = labels[class_id]
+
+        x1, y1, x2, y2 = map(
+            int,
+            det[2:6]
+        )
+        dim7=float(det[6])
+        dim8=float(det[7])
+
+        page_results.append({
+            "label":label,
+            "score":score,
+            "box":[x1,y1,x2,y2],
+            "dim7" : dim7,
+            "dim8":dim8,
+        })
+
+        if save_image:
+            cv2.rectangle(
+                img,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                img,
+                label,
+                (x1, max(20, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1
+            )
+
+    if save_image:
+        cv2.imwrite(str(output_path), img)
+
+    page_results.sort(key=lambda x: x["dim7"])
+
+    return bbox_count, page_results
+
+def run_layout(pdf_path: str | Path, output_path: str | Path, save_images: bool = False,
+               score_threshold: float = SCORE_THRESHOLD,
+               labels: list[str] = LABELS) -> dict[str, list[dict]]:
+    """Run layout detection on every page of a PDF and write the result as JSON.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        output_path: JSON file to write the per-page detections to.
+        save_images: Also write one annotated image per page next to output_path.
+        score_threshold: Minimum score to keep a detection.
+        labels: Class-index-to-label list.
+
+    Returns:
+        Mapping from page key (`page_N`) to its list of detection dicts.
+    """
+    pdf_path = Path(pdf_path)
+    output_path = Path(output_path)
+
+    doc = fitz.open(pdf_path)
+    doc_json_data = {}
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+
+        x, im_shape, scale_factor, image = preprocess_page(page)
+        detections = run_inference(predictor, x, im_shape, scale_factor)
+
+        output_img = None
+        if save_images:
+            output_img = output_path.parent / f"{pdf_path.stem}_page_{page_idx}.jpg"
+
+        _, page_data = save_layout_result(
+            image, detections, labels, output_img,
+            score_threshold=score_threshold, save_image=save_images,
+        )
+
+        doc_json_data[f"page_{page_idx}"] = page_data
+
+    doc.close()
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(doc_json_data, f, indent=4)
+
+    return doc_json_data
+
+
+
+### layout cleaning
+
+
+def area(box: list[int]) -> int:
+    """Return the area of a bbox `[x1, y1, x2, y2]`."""
+    w = max(0, box[2] - box[0])
+    h = max(0, box[3] - box[1])
+    return w * h
+
+def intersection_area(a: list[int], b: list[int]) -> float:
+    """Return the area of the intersection of two bboxes."""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+def iou(a: list[int], b: list[int]) -> float:
+    """Return the Intersection-over-Union of two bboxes."""
+    inter = intersection_area(a, b)
+    union = area(a) + area(b) - inter
+    return inter / union if union > 0 else 0.0
+
+def ioa(a: list[int], b: list[int]) -> float:
+    """Return the Intersection-over-the-smaller-box ratio of two bboxes."""
+    inter = intersection_area(a, b)
+    smaller = min(area(a), area(b))
+    return inter / smaller if smaller > 0 else 0.0
+
+
+def step_a1_intra_class_containment(detections: list[dict],
+                                    ioa_threshold: float = 0.80) -> list[dict]:
+    """Drop same-class bboxes contained in a larger one (>= ioa_threshold).
+
+    Args:
+        detections: Page detections to filter.
+        ioa_threshold: Min intersection-over-smaller ratio to treat as contained.
+
+    Returns:
+        Filtered detections, original (dim7) order preserved.
+    """
+    n = len(detections)
+    keep = [True] * n
+
+    # Indices sorted by decreasing area: we process the large ones first
+    indices_sorted = sorted(range(n), key=lambda i: -area(detections[i]["box"]))
+
+    for i in range(n):
+        idx_big = indices_sorted[i]
+        if not keep[idx_big]:
+            continue
+        big = detections[idx_big]
+        for j in range(i + 1, n):  # j > i => idx_small has area <= idx_big
+            idx_small = indices_sorted[j]
+            if not keep[idx_small]:
+                continue
+            small = detections[idx_small]
+            if small["label"] != big["label"]:
+                continue
+            if ioa(small["box"], big["box"]) >= ioa_threshold:
+                keep[idx_small] = False
+
+    return [d for d, k in zip(detections, keep) if k]
+
+
+
+def process_step_a1(input_path: str | Path, output_path: str | Path,
+                    ioa_threshold: float = 0.80, verbose: bool = True) -> dict[str, list[dict]]:
+    """Apply step A1 to a results JSON file and write the filtered result.
+
+    Args:
+        input_path: Detections JSON to read.
+        output_path: JSON file to write the filtered detections to.
+        ioa_threshold: Containment threshold passed to step A1.
+        verbose: Log per-step and per-page removal stats.
+
+    Returns:
+        Filtered detections, same `{page_key: [detections]}` structure.
+    """
+    with open(input_path) as f:
+        results = json.load(f)
+
+    cleaned = {}
+    total_in, total_out = 0, 0
+    per_page = []
+    for page_key, detections in results.items():
+        before = len(detections)
+        cleaned[page_key] = step_a1_intra_class_containment(detections, ioa_threshold)
+        after = len(cleaned[page_key])
+        total_in += before
+        total_out += after
+        per_page.append((page_key, before, after))
+
+    with open(output_path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+
+    if verbose:
+        logger.info(f"A1 : {total_in} -> {total_out} bboxes ({total_in - total_out} removed)")
+        # Show the most impacted pages
+        per_page.sort(key=lambda x: x[2] - x[1])
+        for page, before, after in per_page[:5]:
+            if before != after:
+                logger.debug(f"  {page}: {before} -> {after}")
+
+    return cleaned
+
+
+def priority(label: str) -> int | None:
+    """Return the label's priority rank, or None if it is not ranked."""
+    return CLASS_PRIORITY.get(label)
+
+def resolve_conflict(d1: dict, d2: dict) -> int:
+    """Return the index (0 or 1) of the loser between two conflicting detections.
+
+    The loser is the one without an explicit priority; if both are ranked, the lower
+    priority (higher rank number); if both are unranked or same-ranked, the lower score.
+
+    Args:
+        d1: First detection.
+        d2: Second detection.
+
+    Returns:
+        `0` if `d1` loses, `1` if `d2` loses.
+    """
+    p1, p2 = priority(d1["label"]), priority(d2["label"])
+
+    if p1 is not None and p2 is None:
+        return 1  # d2 loses
+    if p2 is not None and p1 is None:
+        return 0  # d1 loses
+    if p1 is not None and p2 is not None and p1 != p2:
+        return 0 if p1 > p2 else 1
+
+    # Same priority (or neither) -> better score wins
+    return 1 if d1["score"] >= d2["score"] else 0
+
+
+def step_a2_inter_class_conflict(detections: list[dict],
+                                 iou_threshold: float = 0.95) -> list[dict]:
+    """Drop the loser of each different-label pair overlapping at >= iou_threshold.
+
+    Args:
+        detections: Page detections to filter.
+        iou_threshold: Min IoU for two different-label boxes to conflict.
+
+    Returns:
+        Filtered detections, original (dim7) order preserved.
+    """
+    n = len(detections)
+    keep = [True] * n
+
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            d1, d2 = detections[i], detections[j]
+            if d1["label"] == d2["label"]:
+                continue
+            if iou(d1["box"], d2["box"]) < iou_threshold:
+                continue
+            loser = resolve_conflict(d1, d2)
+            keep[[i, j][loser]] = False
+            if loser == 0:
+                break  # d1 removed, no point continuing its loop
+
+    return [d for d, k in zip(detections, keep) if k]
+
+
+
+def process_step_a2(input_path: str | Path, output_path: str | Path,
+                    iou_threshold: float = 0.95, verbose: bool = True) -> dict[str, list[dict]]:
+    """Apply step A2 to a results JSON file and write the filtered result.
+
+    Args:
+        input_path: Detections JSON to read.
+        output_path: JSON file to write the filtered detections to.
+        iou_threshold: Conflict threshold passed to step A2.
+        verbose: Log per-step removal stats.
+
+    Returns:
+        Filtered detections, same `{page_key: [detections]}` structure.
+    """
+    with open(input_path) as f:
+        results = json.load(f)
+
+    cleaned = {}
+    total_in, total_out = 0, 0
+    for page_key, detections in results.items():
+        cleaned[page_key] = step_a2_inter_class_conflict(detections, iou_threshold)
+        total_in += len(detections)
+        total_out += len(cleaned[page_key])
+
+    with open(output_path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+
+    if verbose:
+        logger.info(f"A2 : {total_in} -> {total_out} bboxes ({total_in - total_out} removed)")
+
+    return cleaned
+
+def step_a3_inter_class_containment(detections: list[dict],
+                                    ioa_threshold: float = 0.80) -> list[dict]:
+    """Drop non-container, non-protected bboxes contained in a container (>= ioa_threshold).
+
+    Args:
+        detections: Page detections to filter.
+        ioa_threshold: Min intersection-over-smaller ratio to treat as contained.
+
+    Returns:
+        Filtered detections, original (dim7) order preserved.
+    """
+    n = len(detections)
+    keep = [True] * n
+
+    # Indices sorted by decreasing area: we process the large containers first
+    indices_sorted = sorted(range(n), key=lambda i: -area(detections[i]["box"]))
+
+    for i in indices_sorted:
+        if not keep[i]:
+            continue
+        container = detections[i]
+        if container["label"] not in CONTAINERS:
+            continue
+        for j in range(n):
+            if i == j or not keep[j]:
+                continue
+            other = detections[j]
+            if other["label"] in CONTAINERS:
+                continue  # nested container: keep it
+            if other["label"] in PROTECTED:
+                continue  # protected element: keep it
+            if ioa(other["box"], container["box"]) >= ioa_threshold:
+                keep[j] = False
+
+    return [d for d, k in zip(detections, keep) if k]
+
+
+def process_step_a3(input_path: str | Path, output_path: str | Path,
+                    ioa_threshold: float = 0.80, verbose: bool = True) -> dict[str, list[dict]]:
+    """Apply step A3 to a results JSON file and write the filtered result.
+
+    Args:
+        input_path: Detections JSON to read.
+        output_path: JSON file to write the filtered detections to.
+        ioa_threshold: Containment threshold passed to step A3.
+        verbose: Log per-step and per-page removal stats.
+
+    Returns:
+        Filtered detections, same `{page_key: [detections]}` structure.
+    """
+    with open(input_path) as f:
+        results = json.load(f)
+
+    cleaned = {}
+    total_in, total_out = 0, 0
+    impacted = []
+    for page_key, detections in results.items():
+        cleaned[page_key] = step_a3_inter_class_containment(detections, ioa_threshold)
+        before, after = len(detections), len(cleaned[page_key])
+        total_in += before
+        total_out += after
+        if before != after:
+            impacted.append((page_key, before, after))
+
+    with open(output_path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+
+    if verbose:
+        logger.info(f"A3 : {total_in} -> {total_out} bboxes ({total_in - total_out} removed)")
+        for page, before, after in impacted:
+            logger.debug(f"  {page}: {before} -> {after}  (-{before - after})")
+
+    return cleaned
+
+
+def step_a3b_textual_containment(detections: list[dict],
+                                 ioa_threshold: float = 0.80) -> list[dict]:
+    """Drop non-visual bboxes geometrically contained in a larger non-visual one.
+
+    Visual containers (table, image, chart, content) are out of scope (handled by
+    A3); PROTECTED labels are not exempt here.
+
+    Args:
+        detections: Page detections to filter.
+        ioa_threshold: Min intersection-over-smaller ratio to treat as contained.
+
+    Returns:
+        Filtered detections, original (dim7) order preserved.
+    """
+    n = len(detections)
+    keep = [True] * n
+
+    # Only NON-VISUAL elements take part, sorted by decreasing area.
+    indices_sorted = sorted(
+        (i for i in range(n) if detections[i]["label"] not in CONTAINERS),
+        key=lambda i: -area(detections[i]["box"]),
+    )
+
+    for pos, idx_big in enumerate(indices_sorted):
+        if not keep[idx_big]:
+            continue
+        big = detections[idx_big]
+        for idx_small in indices_sorted[pos + 1:]:  # area <= big => B is the smaller one
+            if not keep[idx_small]:
+                continue
+            small = detections[idx_small]
+            if ioa(small["box"], big["box"]) >= ioa_threshold:
+                keep[idx_small] = False
+
+    return [d for d, k in zip(detections, keep) if k]
+
+
+def process_step_a3b(input_path: str | Path, output_path: str | Path,
+                     ioa_threshold: float = 0.80, verbose: bool = True) -> dict[str, list[dict]]:
+    """Apply step A3b to a results JSON file and write the filtered result.
+
+    Args:
+        input_path: Detections JSON to read.
+        output_path: JSON file to write the filtered detections to.
+        ioa_threshold: Containment threshold passed to step A3b.
+        verbose: Log per-step and per-page removal stats.
+
+    Returns:
+        Filtered detections, same `{page_key: [detections]}` structure.
+    """
+    with open(input_path) as f:
+        results = json.load(f)
+
+    cleaned = {}
+    total_in, total_out = 0, 0
+    impacted = []
+    for page_key, detections in results.items():
+        cleaned[page_key] = step_a3b_textual_containment(detections, ioa_threshold)
+        before, after = len(detections), len(cleaned[page_key])
+        total_in += before
+        total_out += after
+        if before != after:
+            impacted.append((page_key, before, after))
+
+    with open(output_path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+
+    if verbose:
+        logger.info(f"A3b : {total_in} -> {total_out} bboxes ({total_in - total_out} removed)")
+        for page, before, after in impacted:
+            logger.debug(f"  {page}: {before} -> {after}  (-{before - after})")
+
+    return cleaned
+
+
+def clean_layout(input_path: str | Path, output_path: str | Path,
+                 save_intermediate: bool = False, verbose: bool = True) -> dict[str, list[dict]]:
+    """Chain cleanup steps A1 -> A2 -> A3 -> A3b and write the final detections.
+
+    Args:
+        input_path: Raw detections JSON to read.
+        output_path: JSON file to write the post-A3b detections to (consumed by OCR).
+        save_intermediate: Also write the A1/A2/A3 intermediate outputs next to output_path.
+        verbose: Log the per-step bbox counts.
+
+    Returns:
+        Final post-A3b detections, `{page_key: [detections]}` structure.
+    """
+    output_path = Path(output_path)
+
+    with open(input_path) as f:
+        results = json.load(f)
+
+    r1 = {pk: step_a1_intra_class_containment(dets, IOA_INTRA_CLASS)
+          for pk, dets in results.items()}
+    r2 = {pk: step_a2_inter_class_conflict(dets, IOU_INTER_CONFLICT)
+          for pk, dets in r1.items()}
+    r3 = {pk: step_a3_inter_class_containment(dets, IOA_INTER_CONTAIN)
+          for pk, dets in r2.items()}
+    r3b = {pk: step_a3b_textual_containment(dets, IOA_INTER_CONTAIN)
+           for pk, dets in r3.items()}
+
+    if save_intermediate:
+        with open(output_path.with_name(f"{output_path.stem}_a1{output_path.suffix}"), "w") as f:
+            json.dump(r1, f, indent=2)
+        with open(output_path.with_name(f"{output_path.stem}_a2{output_path.suffix}"), "w") as f:
+            json.dump(r2, f, indent=2)
+        with open(output_path.with_name(f"{output_path.stem}_a3{output_path.suffix}"), "w") as f:
+            json.dump(r3, f, indent=2)
+
+    with open(output_path, "w") as f:
+        json.dump(r3b, f, indent=2)
+
+    if verbose:
+        n0 = sum(len(d) for d in results.values())
+        n1 = sum(len(d) for d in r1.values())
+        n2 = sum(len(d) for d in r2.values())
+        n3 = sum(len(d) for d in r3.values())
+        n3b = sum(len(d) for d in r3b.values())
+        logger.info(f"A1 : {n0} -> {n1}  |  A2 : {n1} -> {n2}  |  A3 : {n2} -> {n3}"
+              f"  |  A3b : {n3} -> {n3b}  ({n0 - n3b} bboxes removed in total)")
+
+    return r3b
+
+
+
+MARKDOWN 
+
+
+
+from config import TITLE_LABELS, TABLE_LABELS, FIGURE_LABELS
+
+
+def build_markdown(doc_ocr: dict[str, list[dict]]) -> tuple[str, dict[str, tuple[int, list[int]]]]:
+    """Build the page-delimited markdown and an atom-ID-to-bbox map from OCR results.
+
+    Args:
+        doc_ocr: Mapping from page key (`page_N`) to its list of OCR item dicts.
+
+    Returns:
+        `(markdown_str, id_to_bbox)`; `id_to_bbox` maps atom ID to `(page_index, box)`
+        for table/figure/chart atoms only.
+    """
+    blocks = []
+    id_to_bbox = {}
+
+    for page_key in sorted(doc_ocr, key=lambda k: int(k.split("_")[1])):
+        page_index = int(page_key.split("_")[1])
+        blocks.append(f"### Start Page {page_index} ###")
+
+        items = doc_ocr[page_key]
+        for y in sorted(range(len(items)), key=lambda i: items[i]["dim7"]):
+            item = items[y]
+            label = item["label"]
+            text = item["text"]
+            item_id = f"p{page_index}_e{y}"
+
+            if label in TITLE_LABELS:
+                block = f"# {text}" if text else ""
+            elif label in TABLE_LABELS:
+                block = f"[TABLE id={item_id}]"
+                if text:
+                    block += f"\n{text}"
+                id_to_bbox[item_id] = (page_index, item["box"])
+            elif label in FIGURE_LABELS:
+                block = f"[FIGURE id={item_id}]"
+                if text:
+                    block += f"\n{text}"
+                id_to_bbox[item_id] = (page_index, item["box"])
+            else:
+                block = text
+
+            if block:
+                blocks.append(block)
+
+        blocks.append("### End Page ###")
+
+    return "\n\n".join(blocks), id_to_bbox
+
+
+
+OCR 
+
+
+
+import json
+import logging
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+import cv2
+import fitz
+import numpy as np
+import requests
+
+from config import (DPI, MISTRAL_MAX_CONCURRENCY, MAX_WORKERS, STACK_RATIO_TARGET,
+                    MISTRAL_OCR_MODEL, MISTRAL_OCR_URL)
+from pdf_utils import encode_image_to_base64, rasterize_page
+
+
+logger = logging.getLogger(__name__)
+
+
+# Stacking geometry, shared by build_stacked_image and the partition budget
+# (values unchanged, just named so they don't diverge between the two).
+STACK_PAD = 15
+STACK_MARKER_H = 26
+
+
+def call_mistral_ocr(image_b64: str) -> tuple[dict | None, float, str | None]:
+    """Call Mistral OCR on a base64-encoded PNG image.
+
+    Args:
+        image_b64: Base64-encoded PNG payload.
+
+    Returns:
+        `(response_json, elapsed_ms, error)`: on success `error` is None; on failure
+        `response_json` is None and `error` holds the message.
+    """
+    HEADERS = {"Content-Type": "application/json"}
+    payload = {
+        "model": MISTRAL_OCR_MODEL,
+        "document": {
+            "type": "image_url",
+            "image_url": f"data:image/png;base64,{image_b64}",
+        },
+    }
+    try:
+        start_time = time.time()
+        response = requests.post(MISTRAL_OCR_URL, headers=HEADERS, json=payload, timeout=30)
+        elapsed = (time.time() - start_time) * 1000  # in ms
+
+        if response.status_code == 200:
+            return response.json(), elapsed, None
+        else:
+            return None, elapsed, f"API ERROR : {response.status_code} - {response.text}"
+
+    except Exception as e:
+        return None, 0, str(e)
+
+
+def _stack_width(ordered_bboxes: list[dict]) -> int:
+    """Return the stacked-image width: widest crop plus margin, at least 160px.
+
+    Args:
+        ordered_bboxes: Layout items with a `box` `[x1, y1, x2, y2]`.
+
+    Returns:
+        Width in pixels.
+    """
+    return max(max(int(e["box"][2]) - int(e["box"][0]) for e in ordered_bboxes) + 40, 160)
+
+
+def build_stacked_image(page_img: np.ndarray, ordered_bboxes: list[dict],
+                        pad: int = STACK_PAD, marker_h: int = STACK_MARKER_H,
+                        font_scale: float = 0.6, index_offset: int = 0,
+                        max_w: int | None = None) -> np.ndarray:
+    """Stack the crops vertically, each under a `[bbox_i]` marker band.
+
+    Args:
+        page_img: The already-rasterized page, to avoid reopening the PDF per crop.
+        ordered_bboxes: Layout items to stack, each with a `box` `[x1, y1, x2, y2]`.
+        pad: White padding between rows, in pixels.
+        marker_h: Height of each marker band, in pixels.
+        font_scale: OpenCV font scale for the marker text.
+        index_offset: Added to each marker index so markers stay global to the page.
+        max_w: Imposed image width; None computes it from this subset.
+
+    Returns:
+        The stacked image as an RGB array.
+    """
+    if max_w is None:
+        max_w = _stack_width(ordered_bboxes)
+    rows = [np.full((pad, max_w, 3), 255, dtype=np.uint8)]
+    for i, e in enumerate(ordered_bboxes):
+        x1, y1, x2, y2 = map(int, e["box"])
+        crop = page_img[y1:y2, x1:x2]
+
+        band = np.full((marker_h, max_w, 3), 255, dtype=np.uint8)
+        cv2.putText(band, f"[bbox_{i + index_offset:03d}]", (10, marker_h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+        rows.append(band)
+
+        h, w = crop.shape[:2]
+        canvas = np.full((h, max_w, 3), 255, dtype=np.uint8)
+        canvas[:, 20:w+20] = crop
+        rows.append(canvas)
+        rows.append(np.full((pad, max_w, 3), 255, dtype=np.uint8))
+
+    band = np.full((marker_h, max_w, 3), 255, dtype=np.uint8)
+    cv2.putText(band, "[bbox_999]", (10, marker_h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    rows.append(band)
+    rows.append(np.full((pad, max_w, 3), 255, dtype=np.uint8))
+
+    return np.vstack(rows)
+
+
+def partition_by_ratio(ordered: list[dict], page_width: int, ratio_target: float,
+                       pad: int = STACK_PAD, marker_h: int = STACK_MARKER_H,
+                       ) -> list[list[dict]]:
+    """Greedily split `ordered` into contiguous groups whose stacked image stays
+    under `ratio_target` (height / page_width).
+
+    A single crop taller than the budget stays alone in its (non-splittable) group.
+
+    Args:
+        ordered: Layout items in dim7 order (preserved across the split).
+        page_width: Stacked-image width, in pixels.
+        ratio_target: Maximum height / page_width ratio per group.
+        pad: White padding between rows, in pixels.
+        marker_h: Height of each marker band, in pixels.
+
+    Returns:
+        Groups of items, each rendered as one stacked sub-image.
+    """
+    budget = page_width * ratio_target
+    groups = []
+    cur = []
+    cur_h = pad  # initial pad at the top of the image
+    for e in ordered:
+        item_h = marker_h + (int(e["box"][3]) - int(e["box"][1])) + pad
+        if cur and cur_h + item_h > budget:
+            groups.append(cur)
+            cur = []
+            cur_h = pad
+        cur.append(e)
+        cur_h += item_h
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def split_markdown_by_markers(markdown: str) -> dict[int, str]:
+    """Split the markdown on `[bbox_i]` markers into `{marker_index: text}`.
+
+    Args:
+        markdown: OCR markdown containing `[bbox_i]` markers.
+
+    Returns:
+        Mapping from marker index to the text that follows it.
+    """
+    parts = re.split(r"\[bbox_(\d+)\]", markdown, flags=re.IGNORECASE)
+    # parts = [before_1st_marker, idx0, text0, idx1, text1, ...]
+    it = iter(parts[1:])
+    return {int(idx): text.strip() for idx, text in zip(it, it)}
+
+
+# Plafond GLOBAL d'appels Mistral simultanés, partagé par tous les threads
+# (toutes pages, tous docs confondus). Voir note sur le rate limit plus bas.
+_MISTRAL_SEM = threading.Semaphore(MISTRAL_MAX_CONCURRENCY)
+
+
+def process_one_page(pdf_path: str | Path, page_key: str, bbox_entries: list[dict],
+                     dpi: int = DPI) -> tuple[str, list[dict], float]:
+    """Run OCR for one page and return its enriched items.
+
+    A dense page whose stack would exceed `STACK_RATIO_TARGET` is split into several
+    sub-images (one OCR call each) then merged; otherwise one image, one call.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        page_key: Page identifier of the form `page_<index>`.
+        bbox_entries: Layout items detected on the page.
+        dpi: Rasterization resolution.
+
+    Returns:
+        `(page_key, enriched_items, elapsed_s)`.
+    """
+    t0 = time.time()
+    # Page sans aucune détection : entrée vide directe, pas de stacking ni d'appel OCR
+    # (build_stacked_image planterait sur max() d'une séquence vide).
+    if not bbox_entries:
+        return page_key, [], time.time() - t0
+    page_idx = int(page_key.split("_")[1])
+    ordered = sorted(bbox_entries, key=lambda b: b["dim7"])
+
+    doc = fitz.open(pdf_path)
+    page_img = rasterize_page(doc[page_idx], dpi)
+    doc.close()
+
+    page_width = _stack_width(ordered)
+    budget = page_width * STACK_RATIO_TARGET
+    groups = partition_by_ratio(ordered, page_width, STACK_RATIO_TARGET)
+
+    enriched = []
+    offset = 0
+    for group in groups:
+        stacked = build_stacked_image(page_img, group, index_offset=offset, max_w=page_width)
+        b64 = encode_image_to_base64(stacked)
+        with _MISTRAL_SEM:
+            ocr_result, _, error = call_mistral_ocr(b64)
+        # Réponse renvoyée mais malformée (pas de 'pages' exploitable) : traitée comme
+        # une erreur OCR (mapping vide + ocr_error sur chaque item), comme un error non-None.
+        if error is None and not (isinstance(ocr_result, dict) and ocr_result.get("pages")):
+            error = f"OCR malformed response: missing/empty 'pages' (page {page_idx})"
+            logger.warning(error)
+            ocr_result = None
+        mapping = split_markdown_by_markers(ocr_result["pages"][0]["markdown"]) if ocr_result else {}
+
+        # Crop unique trop haut pour le budget : accepté seul (image hors ratio) -> signalé.
+        crop_h = int(group[0]["box"][3]) - int(group[0]["box"][1])
+        oversize = len(group) == 1 and STACK_PAD + STACK_MARKER_H + crop_h + STACK_PAD > budget
+        for j, e in enumerate(group):
+            item = {**e, "text": mapping.get(offset + j, ""), "ocr_error": error}
+            if oversize:
+                item["stack_oversize"] = True
+            enriched.append(item)
+        offset += len(group)
+
+    page_time = time.time() - t0
+    return page_key, enriched, page_time
+
+
+def process_document(pdf_path: str | Path, layout_json_path: str | Path,
+                     output_json_path: str | Path, max_workers: int = MAX_WORKERS,
+                     dpi: int = DPI) -> dict[str, Any]:
+    """OCR a whole document: process every page, write the enriched JSON, return stats.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        layout_json_path: Cleaned layout JSON to read the per-page bboxes from.
+        output_json_path: Destination for the enriched per-page OCR JSON.
+        max_workers: Thread-pool size for concurrent page OCR.
+        dpi: Rasterization resolution.
+
+    Returns:
+        Stats: `pdf`, `pages`, `avg_page_s`, `wall_s`, `throughput`.
+    """
+    with open(layout_json_path) as f:
+        layout = json.load(f)
+
+    results = {}
+    page_times = []
+    t_doc = time.time()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(process_one_page, pdf_path, pk, layout[pk], dpi): pk
+                   for pk in layout}
+        for fut in as_completed(futures):
+            page_key, enriched, page_time = fut.result()
+            results[page_key] = enriched
+            page_times.append(page_time)
+
+    wall = time.time() - t_doc
+    # pages réordonnées (l'exécution parallèle les remplit dans l'ordre d'arrivée)
+    results = {k: results[k] for k in sorted(results, key=lambda k: int(k.split("_")[1]))}
+    with open(output_json_path, "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    avg = sum(page_times) / len(page_times) if page_times else 0
+    return {
+        "pdf": pdf_path,
+        "pages": len(page_times),
+        "avg_page_s": avg,          # temps moyen par page (cumul des threads)
+        "wall_s": wall,             # temps réel total (avec parallélisme)
+        "throughput": len(page_times) / wall if wall else 0,  # pages/s effectif
+    }
+
+
+def benchmark_documents(docs: list[dict[str, str]], max_workers: int = MAX_WORKERS,
+                        dpi: int = DPI) -> list[dict[str, Any]]:
+    """OCR several documents and log per-document and global timing stats.
+
+    Args:
+        docs: One dict per document with `pdf`, `layout` and `output` paths.
+        max_workers: Thread-pool size for concurrent page OCR.
+        dpi: Rasterization resolution.
+
+    Returns:
+        One stats dict per document (see `process_document`).
+    """
+    all_stats = []
+    for d in docs:
+        stats = process_document(d["pdf"], d["layout"], d["output"],
+                                 max_workers=max_workers, dpi=dpi)
+        all_stats.append(stats)
+        logger.info(f"\n[{d['pdf'].split('/')[-1]}]")
+        logger.info(f"  pages          : {stats['pages']}")
+        logger.info(f"  avg/page (thread): {stats['avg_page_s']:.2f} s")
+        logger.info(f"  wall total     : {stats['wall_s']:.1f} s")
+        logger.info(f"  throughput     : {stats['throughput']:.2f} pages/s")
+
+    tot_pages = sum(s["pages"] for s in all_stats)
+    tot_wall = sum(s["wall_s"] for s in all_stats)
+    logger.info("\n=== GLOBAL ===")
+    logger.info(f"  docs           : {len(all_stats)}")
+    logger.info(f"  pages totales  : {tot_pages}")
+    logger.info(f"  wall cumulé    : {tot_wall:.1f} s")
+    logger.info(f"  avg/page global: {tot_wall / tot_pages:.2f} s") if tot_pages else None
+    return all_stats
+
+
+SKIP = {"image", "chart"}  # vide normal pour ceux-là, on les ignore
+
+
+def audit_ocr(doc_ocr: dict[str, list[dict]]) -> None:
+    """Log, per page, the share of non-skipped items with empty text as a likely
+    OCR-failure flag.
+
+    Args:
+        doc_ocr: Per-page OCR items.
+    """
+    for page_key, items in doc_ocr.items():
+        expect = [it for it in items if it["label"] not in SKIP]
+        if not expect:
+            continue
+        empty = [it for it in expect if not (it.get("text") or "").strip()]
+        rate = len(empty) / len(expect)
+        flag = "FLAG" if rate > 0.5 else " ok "
+        logger.info(f"  [{flag}] {page_key}: {len(empty)}/{len(expect)} vides ({rate:.0%})")
+
+
+
+PDF UTILS 
+
+
+
+import base64
+from collections.abc import Sequence
+from pathlib import Path
+
+import cv2
+import fitz
+import numpy as np
+
+from config import DPI
+
+
+def rasterize_page(page: fitz.Page, dpi: int = DPI) -> np.ndarray:
+    """Rasterize a fitz page into an RGB numpy image.
+
+    Args:
+        page: Source page to rasterize.
+        dpi: Rendering resolution in dots per inch.
+
+    Returns:
+        RGB image as an `(H, W, 3)` uint8 array (a detached copy of the pixmap buffer).
+    """
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(dpi / 72, dpi / 72),
+        colorspace=fitz.csRGB,
+    )
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+
+
+def encode_image_to_base64(image_rgb: np.ndarray) -> str:
+    """Encode a numpy RGB image into a base64 PNG string.
+
+    Converts RGB -> BGR internally (cv2.imencode expects BGR), so callers pass the
+    RGB image straight from rasterize_page (single conversion point, no cvtColor at
+    the call sites).
+
+    Args:
+        image_rgb: RGB image as an `(H, W, 3)` uint8 array.
+
+    Returns:
+        Base64-encoded PNG of the image.
+    """
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode('.png', bgr)
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+def pdf_to_image_bbox(pdf_path: str | Path, page_index: int, box: Sequence[int],
+                      dpi: int = DPI) -> np.ndarray:
+    """Rasterize page `page_index` and return the crop for `box`.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        page_index: 0-indexed page to rasterize.
+        box: Bounding box `(x1, y1, x2, y2)` in raster-pixel coordinates.
+        dpi: Rendering resolution used to rasterize the page.
+
+    Returns:
+        RGB crop of the boxed region as an `(H, W, 3)` uint8 array.
+    """
+    doc = fitz.open(pdf_path)
+    page_img = rasterize_page(doc[page_index], dpi)
+    doc.close()
+    x1, y1, x2, y2 = map(int, box)
+    return page_img[y1:y2, x1:x2]
+
+
+def page_dims_from_pdf(pdf_path: str | Path, dpi: int = DPI) -> dict[int, tuple[int, int]]:
+    """Return per-page pixel dimensions at `dpi` without rasterizing.
+
+    Computed from `page.rect * dpi/72` (cheap even on 300+ pages). The ±1px
+    difference vs the real pixmap is irrelevant for layout-space reasoning, and the
+    result lives in the SAME coordinate space as the detection boxes (150-DPI raster
+    pixels), so DOM page dimensions and atom bboxes are directly comparable.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        dpi: Resolution used to scale `page.rect` into pixels.
+
+    Returns:
+        Mapping from 0-indexed page number to `(width_px, height_px)`.
+    """
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72.0
+    dims = {i: (round(doc[i].rect.width * zoom), round(doc[i].rect.height * zoom))
+            for i in range(len(doc))}
+    doc.close()
+    return dims
+
+
+
+
+PIPELINE 
+
+
+
+import json
+import shutil
+import time
+from pathlib import Path
+from typing import Any
+
+from Layout import run_layout, clean_layout
+from ocr import process_document
+from markdown_build import build_markdown
+
+
+def process_pipeline(pdf_path: str | Path, output_path: str | Path,
+                     save_intermediate: bool = False,
+                     ) -> tuple[str, dict[str, tuple[int, list[int]]], dict[str, list[dict]], dict[str, Any]]:
+    """Run the single-document pipeline: layout -> clean -> OCR -> markdown.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        output_path: Directory under which the per-document work folder is created.
+        save_intermediate: Keep the intermediate work folder instead of deleting it.
+
+    Returns:
+        `(markdown_str, id_to_bbox, doc_ocr, stats)`, where `stats` holds `layout_s`
+        and the OCR stats dict.
+    """
+    pdf_path = Path(pdf_path)
+    stem = pdf_path.stem
+    work = Path(output_path) / stem
+    work.mkdir(parents=True, exist_ok=True)   # the called functions do not create the folder
+
+    layout_raw   = work / f"{stem}_layout.json"
+    layout_clean = work / f"{stem}_layout_clean.json"
+    ocr_json     = work / f"{stem}_ocr.json"
+
+    try:
+        t_layout = time.time()
+        run_layout(pdf_path, layout_raw)
+        clean_layout(layout_raw, layout_clean, save_intermediate=save_intermediate)
+        layout_s = time.time() - t_layout
+
+        ocr_stats = process_document(pdf_path, layout_clean, ocr_json)
+
+        with open(ocr_json, encoding="utf-8") as f:
+            doc_ocr = json.load(f)
+
+        markdown_str, id_to_bbox = build_markdown(doc_ocr)
+        stats = {"layout_s": layout_s, "ocr": ocr_stats}
+    finally:
+        if not save_intermediate:
+            shutil.rmtree(work, ignore_errors=True)
+
+    return markdown_str, id_to_bbox, doc_ocr, stats
+
+
+
+
+
+TOOLS 
+
+
+
+
+from pathlib import Path
+
+import fitz
+
+from pdf_utils import encode_image_to_base64, pdf_to_image_bbox, rasterize_page
+
+
+def get_page(pdf_path: str | Path, page_index: int, dpi: int = 150) -> str:
+    """Rasterize the full PDF page and return it as a base64 PNG.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        page_index: 0-indexed page to render.
+        dpi: Rendering resolution in dots per inch.
+
+    Returns:
+        Base64-encoded PNG of the full page.
+    """
+    doc = fitz.open(pdf_path)
+    page_img = rasterize_page(doc[page_index], dpi)
+    doc.close()
+    return encode_image_to_base64(page_img)
+
+
+def get_crop(item_id: str, id_to_bbox: dict[str, tuple[int, list[int]]],
+             pdf_path: str | Path, dpi: int = 150) -> str:
+    """Return the base64-encoded PNG crop of element `item_id`.
+
+    Args:
+        item_id: Stable atom ID, formatted `p{page}_e{idx}`.
+        id_to_bbox: Mapping from atom ID to `(page_index, [x1, y1, x2, y2])`.
+        pdf_path: Path to the source PDF.
+        dpi: Rendering resolution used to rasterize the source page.
+
+    Returns:
+        Base64-encoded PNG of the cropped region.
+
+    Raises:
+        KeyError: If `item_id` is not present in `id_to_bbox`.
+    """
+    if item_id not in id_to_bbox:
+        raise KeyError(f"unknown id: {item_id!r} (not in id_to_bbox)")
+    page_index, box = id_to_bbox[item_id]
+    crop = pdf_to_image_bbox(pdf_path, page_index, box, dpi)
+    return encode_image_to_base64(crop)
