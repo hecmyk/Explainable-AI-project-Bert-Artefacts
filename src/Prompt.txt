@@ -1,0 +1,712 @@
+# Prompt templates for the extraction agent (agent.py), loaded at module level via
+# yaml.safe_load. `{name}` fields are Python str.format() placeholders (phase2_user only).
+
+phase1_system: |-
+  You extract structured fields from a document provided as markdown (OCR text).
+  Extract every field you can directly from the markdown text.
+  Pages are delimited by '### Start Page N ###' and '### End Page ###' markers and are 0-indexed: the first page is page 0. The page_num field in submit_draft MUST match this 0-indexed marker, NOT any page number that may appear inside the page content itself (footers, headers, 'Page X of Y' mentions). Trust the marker, not the OCR'd content.
+  Tools — use ONLY when the markdown text is insufficient:
+    - get_crop(item_id): a value lives in a table/figure whose transcription looks corrupted or unreadable. Valid ids appear as [TABLE id=...] / [FIGURE id=...].
+    - get_page(page_index): you need a page's visual/spatial context. Use the 0-indexed page number from the '### Start Page N ###' marker.
+  Do NOT call a tool when the text already gives the answer.
+  Keep values and citations in the document's original language — never translate.
+  When you are done, you MUST finish by calling submit_draft with all fields. For each field set source='text' if you read the value in the markdown, or source='visual' if you read it from a tool image. Use null for value/citation/page_num when a field is absent from the document.
+
+phase2_system: |-
+  You receive the rendered image of ONE document page, the definitions of the fields to verify on this page, and the values that were extracted for them from the OCR text.
+  Most extracted values are already correct: keep a value unchanged unless the image clearly contradicts it. When in doubt, keep the extracted value.
+  For each field, use the provided citation ONLY to locate the relevant zone on the image — it tells you WHERE to look, not WHAT the value is, because the OCR text may be silently corrupted. Read the value from the image at that location and compare it with the extracted value; correct it only to match what the pixels actually show.
+  Do NOT change the scope of a field: never shorten or extend it beyond what its definition asks, and never replace its value with one taken from a different zone or a neighbouring field. Verify each field strictly against its own definition.
+  Keep citations in the document's original language — never translate. Finish by calling submit_page_corrections with the fields for this page.
+
+phase2_user: |-
+  Field definitions:
+  {defs_block}
+
+  Values extracted from this page (page {page}):
+  {desc}
+
+
+
+
+
+
+
+
+
+
+
+AGENT :
+
+import json
+import time
+from collections import Counter
+from collections.abc import Sequence
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+# Requires PyYAML (external runtime dependency, not declared in this repo).
+import yaml
+from openai import OpenAI
+
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+from tools import get_crop, get_page
+
+
+client = OpenAI(
+    base_url=MISTRAL_BASE_URL,
+    api_key=MISTRAL_API_KEY,
+)
+MODEL = MISTRAL_AGENT_MODEL
+
+
+# --------------------------------------------------------------------------- #
+# Prompts                                                                      #
+# --------------------------------------------------------------------------- #
+with open(Path(__file__).parent / "prompts.yaml", encoding="utf-8") as f:
+    PROMPTS = yaml.safe_load(f)
+
+
+# --------------------------------------------------------------------------- #
+# Tool definitions                                                             #
+# --------------------------------------------------------------------------- #
+READ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_page",
+            "description": (
+                "Retrieve the full rendered image of a page, for visual/spatial context "
+                "or to read a figure in its surroundings."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_index": {
+                        "type": "integer",
+                        "description": "Page number, as shown in the markdown by '### Start Page N ###'.",
+                    },
+                },
+                "required": ["page_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_crop",
+            "description": (
+                "Retrieve a close-up image of a specific table/figure when its "
+                "transcription looks wrong or unreadable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "Element id in the form pX_eY, as shown by [TABLE id=...] / [FIGURE id=...].",
+                    },
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+]
+
+
+def _draft_field_schema() -> dict[str, Any]:
+    """Return the JSON schema for one draft field (per-field schema plus `source`)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "value": {"type": ["string", "null"]},
+            "citation": {"type": ["string", "null"]},
+            "page_num": {"type": ["array", "null"], "items": {"type": "integer"}},
+            "source": {"type": "string", "enum": ["text", "visual"]},
+        },
+        "required": ["value", "citation", "page_num", "source"],
+    }
+
+
+def _correction_field_schema() -> dict[str, Any]:
+    """Return the JSON schema for one phase-2 correction field (draft keys minus `source`)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "value": {"type": ["string", "null"]},
+            "citation": {"type": ["string", "null"]},
+            "page_num": {"type": ["array", "null"], "items": {"type": "integer"}},
+        },
+        "required": ["value", "citation", "page_num"],
+    }
+
+
+def _build_submit_draft_tool(field_names: Sequence[str]) -> dict[str, Any]:
+    """Build the phase-1 `submit_draft` finish-tool for the expected fields.
+
+    Args:
+        field_names: Names of the fields to extract.
+
+    Returns:
+        An OpenAI tool definition.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_draft",
+            "description": "Submit the extracted draft for all fields. Call this exactly once when extraction is complete.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {f: _draft_field_schema() for f in field_names},
+                "required": list(field_names),
+            },
+        },
+    }
+
+
+def _build_submit_page_corrections_tool(field_names: Sequence[str]) -> dict[str, Any]:
+    """Build the phase-2 `submit_page_corrections` finish-tool for the expected fields.
+
+    The corrections object is non-strict: the agent may omit fields it has no opinion on.
+
+    Args:
+        field_names: Names of the fields to verify.
+
+    Returns:
+        An OpenAI tool definition.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_page_corrections",
+            "description": "Submit verified/corrected fields for the current page. Omit a field only if you truly have no opinion on it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "corrections": {
+                        "type": "object",
+                        "properties": {f: _correction_field_schema() for f in field_names},
+                    },
+                },
+                "required": ["corrections"],
+            },
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers                                                              #
+# --------------------------------------------------------------------------- #
+def _safe_args(tc: Any) -> dict[str, Any]:
+    """Return a tool call's arguments as a dict, never raising (schema not guaranteed)."""
+    try:
+        args = json.loads(tc.function.arguments or "{}")
+        return args if isinstance(args, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _norm_page_num(v: Any) -> list[int] | None:
+    """Normalize a model-returned page_num into a list of ints, or None."""
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, list):
+        out = [int(x) for x in v if isinstance(x, (int, float, str)) and str(x).lstrip("-").isdigit()]
+        return out or None
+    return None
+
+
+def _norm_value(v: Any) -> str:
+    """Normalize a value for draft-vs-final comparison: None and whitespace collapse to ''."""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _normalize_draft(args: dict[str, Any], field_names: Sequence[str],
+                     ) -> dict[str, dict[str, Any]]:
+    """Coerce raw tool arguments into the canonical draft shape (the tool schema is only advisory).
+
+    Args:
+        args: Raw arguments from the submit_draft tool call.
+        field_names: Names of the fields to extract.
+
+    Returns:
+        Draft mapping each field to `value`, `citation`, `page_num` and `source`.
+    """
+    draft = {}
+    for f in field_names:
+        sub = args.get(f) if isinstance(args.get(f), dict) else {}
+        src = sub.get("source")
+        draft[f] = {
+            "value": sub.get("value"),
+            "citation": sub.get("citation"),
+            "page_num": _norm_page_num(sub.get("page_num")),
+            "source": src if src in ("text", "visual") else "text",
+        }
+    return draft
+
+
+def _salvage_submit_draft_from_text(content: str | None, field_names: Sequence[str],
+                                    ) -> dict[str, dict[str, Any]] | None:
+    """Recover a submit_draft payload emitted as text in `content`, or None.
+
+    Args:
+        content: Assistant message text that may embed the submit_draft JSON.
+        field_names: Names of the fields to extract.
+
+    Returns:
+        The normalized draft, or None when nothing valid is found.
+    """
+    # submit_draft parfois émis en texte dans content (bug tool-calling Mistral/vLLM) :
+    # on parse le JSON qui suit le token ; json.loads valide (texte après -> échec propre).
+    if not content or "submit_draft" not in content:
+        return None
+    start = content.find("{", content.find("submit_draft"))
+    if start == -1:
+        return None
+    try:
+        parsed = json.loads(content[start:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not (set(parsed) & set(field_names)):
+        return None
+    return _normalize_draft(parsed, field_names)
+
+
+def _salvage_read_tool_from_text(content: str | None) -> tuple[str, dict[str, Any]] | None:
+    """Recover a get_page/get_crop call emitted as text in `content`.
+
+    Args:
+        content: Assistant message text that may embed the tool call.
+
+    Returns:
+        `(tool_name, args)` for the first read-tool found, or None.
+    """
+    if not content:
+        return None
+    hits = [(content.find(n), n) for n in ("get_page", "get_crop") if n in content]
+    if not hits:
+        return None
+    i, name = min(hits)
+    start = content.find("{", i)
+    if start == -1:
+        return None
+    try:
+        args = json.loads(content[start:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    return name, args
+
+
+def _add_usage(response: Any, phase: str, metrics: dict[str, Any]) -> None:
+    """Accumulate an LLM call's token usage into the phase bucket and the global total."""
+    usage = getattr(response, "usage", None)
+    p = getattr(usage, "prompt_tokens", 0) or 0
+    c = getattr(usage, "completion_tokens", 0) or 0
+    tot = getattr(usage, "total_tokens", 0) or 0
+    for bucket in (metrics[f"{phase}_tokens"], metrics["tokens"]):
+        bucket["prompt"] += p
+        bucket["completion"] += c
+        bucket["total"] += tot
+
+
+# --------------------------------------------------------------------------- #
+# Phase helpers + run_agent                                                    #
+# --------------------------------------------------------------------------- #
+def _phase1_draft_acquisition(task_instruction: str, output_schema: dict[str, Any],
+                              markdown_str: str, id_to_bbox: dict[str, tuple[int, list[int]]],
+                              pdf_path: str | Path, model: str, max_steps: int,
+                              metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Phase 1: agentic loop that drafts the fields from the markdown, ending on submit_draft.
+
+    Args:
+        task_instruction: Extraction instruction appended to the markdown.
+        output_schema: JSON schema whose `properties` are the fields to extract.
+        markdown_str: OCR markdown of the document.
+        id_to_bbox: Mapping from atom ID to `(page_index, [x1, y1, x2, y2])`.
+        pdf_path: Path to the source PDF.
+        model: Chat model id.
+        max_steps: Maximum agent turns before forcing submit_draft.
+        metrics: Shared metrics dict, mutated in place.
+
+    Returns:
+        The consolidated draft, each field annotated with its `source`.
+
+    Raises:
+        RuntimeError: If no draft is produced after `max_steps` and the forced call.
+    """
+    field_names = list(output_schema["properties"])
+    tool_calls_by_type = metrics["tool_calls_by_type"]
+    tool_log = metrics["tool_log"]
+    n_turns = metrics["n_turns"]
+    hit_max_iterations = metrics["hit_max_iterations"]
+
+    submit_draft_tool = _build_submit_draft_tool(field_names)
+    phase1_tools = READ_TOOLS + [submit_draft_tool]
+
+    p1_start = time.perf_counter()
+    messages = [
+        {"role": "system", "content": PROMPTS["phase1_system"]},
+        {"role": "user", "content": f"{markdown_str}\n\n{task_instruction}"},
+    ]
+
+    def _extract_submit_draft(message: Any) -> dict[str, dict[str, Any]] | None:
+        """Return the normalized draft if `message` carries the submit_draft finish-call, else None."""
+        for tc in (message.tool_calls or []):
+            if tc.function.name == "submit_draft":
+                return _normalize_draft(_safe_args(tc), field_names)
+        return None
+
+    draft = None
+    for _ in range(max_steps):
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model, messages=messages, tools=phase1_tools,
+        )
+        _add_usage(response, "phase1", metrics)
+        message = response.choices[0].message
+
+        if not message.tool_calls:
+            # Le modèle s'arrête sans tool_call structuré : submit_draft est parfois émis
+            # comme TEXTE dans content (bug tool-calling Mistral/vLLM). On le salvage
+            # directement, sans relancer en forçant submit_draft : ce retry repartait d'un
+            # `messages` amnésique (le tour assistant n'y est jamais ajouté, cf. le 400),
+            # donc le modèle re-décidait de zéro et pouvait écraser un payload déjà valide.
+            # Si rien n'est récupérable ici, le fallback post-boucle rejoue de toute façon
+            # l'appel forcé (requête identique) avant de lever.
+            draft = _salvage_submit_draft_from_text(message.content, field_names)
+            if draft is not None:
+                tool_calls_by_type["submit_draft (text-recovered)"] += 1
+                tool_log.append({"turn": n_turns,
+                                 "tool": "submit_draft (text-recovered)",
+                                 "args": "<draft>"})
+                break
+
+            # get_page/get_crop peuvent aussi sortir en texte. Ici c'est une ACTION, pas une
+            # finish-tool : on l'exécute réellement et on réinjecte l'image par le canal user
+            # (qui ne demande aucun tool_call_id), puis on poursuit la boucle. Le modèle
+            # obtient ce qu'il demandait au lieu de crasher.
+            salvaged = _salvage_read_tool_from_text(message.content)
+            if salvaged is None:
+                break
+            name, args = salvaged
+            tool_calls_by_type[f"{name} (text-recovered)"] += 1
+            tool_log.append({"turn": n_turns, "tool": f"{name} (text-recovered)",
+                             "args": args})
+
+            b64 = None
+            if name == "get_page":
+                try:
+                    b64 = get_page(pdf_path, args["page_index"])
+                    ack = f"image returned for page {args.get('page_index')}"
+                except (KeyError, IndexError):
+                    ack = f"invalid page_index {args.get('page_index')!r}"
+            else:
+                try:
+                    b64 = get_crop(args["item_id"], id_to_bbox, pdf_path)
+                    ack = f"image returned for {args.get('item_id')}"
+                except KeyError:
+                    ack = (f"unknown id {args.get('item_id')!r} — valid ids appear in the "
+                           "markdown as [TABLE id=...] / [FIGURE id=...]")
+
+            # Tour assistant (texte) puis message user : alternance propre, pas de tool_calls
+            # orphelin, et on ne finit pas sur un tour assistant (cf. le 400).
+            messages.append({"role": "assistant", "content": message.content})
+            parts = [{"type": "text", "text": f"{ack}:" if b64 is not None else ack}]
+            if b64 is not None:
+                parts.append({"type": "image_url",
+                              "image_url": {"url": f"data:image/png;base64,{b64}"}})
+            messages.append({"role": "user", "content": parts})
+            continue
+
+        # Si submit_draft est présent (même en parallèle d'autres), on termine.
+        draft = _extract_submit_draft(message)
+        if draft is not None:
+            tool_calls_by_type["submit_draft"] += 1
+            tool_log.append({"turn": n_turns, "tool": "submit_draft", "args": "<draft>"})
+            break
+
+        # Sinon : on rejoue les outils de lecture. Tous les acks role='tool' d'abord,
+        # puis UN message user avec libellé + image par appel (association lisible).
+        messages.append(message.model_dump(exclude_none=True))
+        image_parts = []
+        for tc in message.tool_calls:
+            args = _safe_args(tc)
+            tool_calls_by_type[tc.function.name] += 1
+            tool_log.append({"turn": n_turns, "tool": tc.function.name, "args": args})
+
+            b64 = None
+            if tc.function.name == "get_page":
+                try:
+                    b64 = get_page(pdf_path, args["page_index"])
+                    ack = f"image returned for page {args.get('page_index')}"
+                except (KeyError, IndexError):
+                    ack = f"invalid page_index {args.get('page_index')!r}"
+            elif tc.function.name == "get_crop":
+                try:
+                    b64 = get_crop(args["item_id"], id_to_bbox, pdf_path)
+                    ack = f"image returned for {args.get('item_id')}"
+                except KeyError:
+                    ack = (f"unknown id {args.get('item_id')!r} — valid ids appear in the "
+                           "markdown as [TABLE id=...] / [FIGURE id=...]")
+            else:
+                ack = f"unknown tool {tc.function.name!r}"
+
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": ack})
+            if b64 is not None:
+                image_parts.append({"type": "text", "text": ack + ":"})
+                image_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+        if image_parts:
+            messages.append({"role": "user", "content": image_parts})
+
+    # Plafond atteint sans brouillon : un dernier appel forcé sur submit_draft.
+    # Robustesse endpoint : on n'expose QUE submit_draft (liste à 1 outil) en plus du
+    # named-forcing. Si le shim refuse le named form, remplacer tool_choice par "required".
+    if draft is None:
+        hit_max_iterations = True
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=[submit_draft_tool],
+            tool_choice={"type": "function", "function": {"name": "submit_draft"}},
+        )
+        _add_usage(response, "phase1", metrics)
+        message = response.choices[0].message
+        draft = _extract_submit_draft(message)
+        if draft is not None:
+            tool_calls_by_type["submit_draft"] += 1
+            tool_log.append({"turn": n_turns, "tool": "submit_draft (forced)", "args": "<draft>"})
+        else:
+            draft = _salvage_submit_draft_from_text(message.content, field_names)
+            if draft is not None:
+                tool_calls_by_type["submit_draft (text-recovered)"] += 1
+                tool_log.append({"turn": n_turns,
+                                 "tool": "submit_draft (text-recovered)",
+                                 "args": "<draft>"})
+        if draft is None:
+            raise RuntimeError(
+                "phase 1 failed to produce a draft after max_steps; "
+                f"last message content={message.content!r} "
+                f"tool_calls={message.tool_calls!r}"
+            )
+
+    metrics["phase1_time_s"] = round(time.perf_counter() - p1_start, 2)
+
+    metrics["n_turns"] = n_turns
+    metrics["hit_max_iterations"] = hit_max_iterations
+    return draft
+
+
+def _phase2_page_verification(draft: dict[str, dict[str, Any]], output_schema: dict[str, Any],
+                              pdf_path: str | Path, field_definitions: dict[str, str],
+                              model: str, metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Phase 2: per-page visual verification of text-sourced fields, merged into a final draft.
+
+    Args:
+        draft: The phase-1 draft to verify.
+        output_schema: JSON schema whose `properties` are the fields to extract.
+        pdf_path: Path to the source PDF.
+        field_definitions: Mapping from field name to its definition text.
+        model: Chat model id.
+        metrics: Shared metrics dict, mutated in place.
+
+    Returns:
+        The post-correction draft.
+    """
+    field_names = list(output_schema["properties"])
+    tool_calls_by_type = metrics["tool_calls_by_type"]
+    tool_log = metrics["tool_log"]
+    n_turns = metrics["n_turns"]
+
+    submit_corr_tool = _build_submit_page_corrections_tool(field_names)
+
+    # Pages distinctes citées par des items source='text' avec un page_num non nul.
+    # Convention 0-based dans tout le pipeline : page_num du brouillon -> get_page direct.
+    final_draft = deepcopy(draft)
+    pages_to_verify = sorted({
+        p
+        for f in field_names
+        if draft[f]["source"] == "text" and draft[f]["page_num"]
+        for p in draft[f]["page_num"]
+    })
+
+    p2_start = time.perf_counter()
+    n_pages_verified = 0
+    for page in pages_to_verify:
+        items = {f: draft[f] for f in field_names
+                 if draft[f]["source"] == "text" and draft[f]["page_num"]
+                 and page in draft[f]["page_num"]}
+        if not items:
+            continue
+        try:
+            b64 = get_page(pdf_path, page)
+        except (KeyError, IndexError):
+            continue
+
+        desc = json.dumps(
+            {f: {"value": v["value"], "citation": v["citation"], "page_num": v["page_num"]}
+             for f, v in items.items()},
+            ensure_ascii=False, indent=2,
+        )
+        defs_lines = [f"- {f}: {field_definitions[f]}" for f in items if f in field_definitions]
+        defs_block = "\n".join(defs_lines)
+        text_payload = PROMPTS["phase2_user"].format(
+            defs_block=defs_block, page=page, desc=desc)
+        n_turns += 1
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": PROMPTS["phase2_system"]},
+                {"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text",
+                     "text": text_payload},
+                ]},
+            ],
+            tools=[submit_corr_tool],
+            tool_choice={"type": "function", "function": {"name": "submit_page_corrections"}},
+        )
+        _add_usage(response, "phase2", metrics)
+        n_pages_verified += 1
+
+        corr_tc = next((tc for tc in (response.choices[0].message.tool_calls or [])
+                        if tc.function.name == "submit_page_corrections"), None)
+        if corr_tc is None:
+            continue
+        corrections = _safe_args(corr_tc).get("corrections", {})
+        if not isinstance(corrections, dict):
+            continue
+
+        # Merge déterministe : item présent sur 2 pages -> last-write-wins (par ordre
+        # de page croissant), visible dans la trace via final_value.
+        for f, c in corrections.items():
+            if f not in field_names or not isinstance(c, dict):
+                continue
+            # value/citation ne sont écrasés que si la clé est réellement présente :
+            # une clé absente renvoyait None avec c.get() et effaçait une valeur correcte.
+            if "value" in c:
+                final_draft[f]["value"] = c["value"]
+            if "citation" in c:
+                final_draft[f]["citation"] = c["citation"]
+            final_draft[f]["page_num"] = _norm_page_num(c.get("page_num")) or draft[f]["page_num"]
+            final_draft[f]["source"] = draft[f]["source"]
+        tool_calls_by_type["submit_page_corrections"] += 1
+        tool_log.append({"turn": n_turns, "tool": "submit_page_corrections",
+                         "args": {"page": page, "fields": list(corrections)}})
+
+    metrics["phase2_time_s"] = round(time.perf_counter() - p2_start, 2)
+
+    # Trace des corrections (la métrique qui justifie la phase 2).
+    verified_pages_by_field = {
+        f: (draft[f]["page_num"] or []) if draft[f]["source"] == "text" else []
+        for f in field_names
+    }
+    corrections_trace = {}
+    n_corrections = 0
+    for f in field_names:
+        dv, fv = draft[f]["value"], final_draft[f]["value"]
+        corrected = _norm_value(dv) != _norm_value(fv)
+        n_corrections += int(corrected)
+        corrections_trace[f] = {
+            "draft_value": dv,
+            "final_value": fv,
+            "source": draft[f]["source"],
+            "corrected": corrected,
+            "verified_on_pages": verified_pages_by_field[f] if n_pages_verified else [],
+        }
+
+    metrics["n_turns"] = n_turns
+    metrics["n_pages_verified"] = n_pages_verified
+    metrics["n_corrections"] = n_corrections
+    metrics["corrections_trace"] = corrections_trace
+    return final_draft
+
+
+def _phase3_final_projection(final_draft: dict[str, dict[str, Any]],
+                             output_schema: dict[str, Any]) -> dict[str, Any]:
+    """Phase 3: project the consolidated draft onto `output_schema`, dropping `source`.
+
+    Args:
+        final_draft: The phase-2 draft.
+        output_schema: JSON schema whose `properties` are the fields to extract.
+
+    Returns:
+        Result mapping each field to `value`/`citation`/`page_num`.
+    """
+    field_names = list(output_schema["properties"])
+    # Synthèse déterministe : projection du brouillon consolidé sur output_schema
+    # (drop de 'source'). Aucun appel LLM ici -> pas de tokens ni de temps de phase 3
+    # reportés dans metrics (ce serait du bruit à zéro).
+    result = {f: {"value": final_draft[f]["value"],
+                  "citation": final_draft[f]["citation"],
+                  "page_num": final_draft[f]["page_num"]} for f in field_names}
+    return result
+
+
+def run_agent(task_instruction: str, output_schema: dict[str, Any], markdown_str: str,
+              id_to_bbox: dict[str, tuple[int, list[int]]], pdf_path: str | Path,
+              field_definitions: dict[str, str], model: str = MODEL,
+              max_steps: int = 6) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract structured fields from a document in three phases.
+
+    Phase 1 agentically drafts the fields from the markdown (with get_page/get_crop),
+    ending on the submit_draft finish-tool. Phase 2 verifies each text-sourced field
+    against its page image and merges corrections deterministically. Phase 3 projects
+    the consolidated draft onto `output_schema` with no further LLM call.
+
+    Args:
+        task_instruction: Extraction instruction appended to the markdown.
+        output_schema: JSON schema whose `properties` are the fields to extract.
+        markdown_str: OCR markdown of the document.
+        id_to_bbox: Mapping from atom ID to `(page_index, [x1, y1, x2, y2])`.
+        pdf_path: Path to the source PDF.
+        field_definitions: Mapping from field name to its definition text.
+        model: Chat model id.
+        max_steps: Maximum phase-1 agent turns before forcing submit_draft.
+
+    Returns:
+        `(result, metrics)`: `result` maps each field to `value`/`citation`/`page_num`,
+        `metrics` holds timing, token and tool-call stats.
+    """
+    t0 = time.perf_counter()
+    metrics: dict[str, Any] = {
+        "tool_calls_total": 0,
+        "tool_calls_by_type": Counter(),
+        "tool_log": [],
+        "n_turns": 0,
+        "hit_max_iterations": False,
+        "agent_time_s": 0.0,
+        "tokens": {"prompt": 0, "completion": 0, "total": 0},
+        "phase1_time_s": 0.0,
+        "phase2_time_s": 0.0,
+        "phase1_tokens": {"prompt": 0, "completion": 0, "total": 0},
+        "phase2_tokens": {"prompt": 0, "completion": 0, "total": 0},
+        "n_pages_verified": 0,
+        "n_corrections": 0,
+        "corrections_trace": {},
+    }
+
+    draft = _phase1_draft_acquisition(
+        task_instruction, output_schema, markdown_str, id_to_bbox, pdf_path,
+        model, max_steps, metrics)
+    final_draft = _phase2_page_verification(
+        draft, output_schema, pdf_path, field_definitions, model, metrics)
+    result = _phase3_final_projection(final_draft, output_schema)
+
+    metrics["tool_calls_total"] = sum(metrics["tool_calls_by_type"].values())
+    metrics["agent_time_s"] = round(time.perf_counter() - t0, 2)
+    return result, metrics
