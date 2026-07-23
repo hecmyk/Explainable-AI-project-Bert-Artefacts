@@ -1,0 +1,108 @@
+Emplacement des fichiers
+
+À partir de la racine data-qulality-rules/ (le dossier avec config.yaml, pyproject.toml, README.md) :
+
+data-qulality-rules/
+├── config.yaml
+├── pyproject.toml
+├── README.md
+├── data/
+├── prompts/
+├── artifacts/
+├── scripts/
+├── tests/
+├── src/dq/
+│   ├── __init__.py           (existe déjà)
+│   ├── bootstrap.py          (existe déjà)
+│   ├── loader.py             (existe déjà)
+│   ├── executor.py           (existe déjà)
+│   ├── compiler.py           (existe déjà)
+│   ├── schema.py             (existe déjà)
+│   ├── report.py             (existe déjà)
+│   ├── audit.py              (existe déjà)
+│   ├── llm.py                (existe déjà)
+│   ├── proposals.py          ← NOUVEAU (fichier 1)
+│   └── agent/                ← NOUVEAU dossier
+│       ├── __init__.py       ← NOUVEAU (fichier 2)
+│       ├── prompts.py        ← NOUVEAU (fichier 3)
+│       ├── tools.py          ← NOUVEAU (fichier 4)
+│       └── graph.py          ← NOUVEAU (fichier 5)
+└── app/
+    └── streamlit_app.py      ← NOUVEAU (fichier 6, remplace le placeholder)
+
+Attention : Claude Code a écrit c:\Users\Ali\Desktop\hamza\dq\... mais dans le repo du camarade le package est sous src/dq/ (README dit "src/da/init.py" avec des typos OCR, en réalité src/dq/). Donc tu déplaces :
+
+dq/proposals.py → src/dq/proposals.py
+dq/agent/* → src/dq/agent/*
+app/streamlit_app.py → app/streamlit_app.py (celui-là est bien)
+
+Vérifie quand même la structure exacte avec :
+
+bash
+find . -name "bootstrap.py"
+
+Le fichier proposals.py doit être à côté de bootstrap.py, et le dossier agent/ juste à côté aussi.
+
+Modules à installer
+bash
+pip install langgraph langchain-openai langchain-core streamlit pandas
+
+pandas et streamlit sont probablement déjà là via le pyproject.toml du camarade — pas grave, pip skip.
+
+Vérif rapide avant de lancer
+bash
+cd data-qulality-rules
+python -c "from dq.proposals import load_proposals; print(load_proposals())"
+python -c "from dq.agent.tools import ALL_TOOLS; print(len(ALL_TOOLS))"
+python -c "from dq.agent.graph import build_agent; print('ok')"
+
+Si les 3 passent → lance :
+
+bash
+streamlit run app/streamlit_app.py
+
+
+
+
+
+
+À tester dans cet ordre
+
+1. Est-ce que dq.loader existe avec cette API ?
+
+python
+from dq import loader
+df_fengo, df_bdd, df_dqrc = loader.load_data()
+
+Si ça plante (module absent, ou signature différente), c'est le premier truc à fixer dans tools.py. Regarde comment le camarade charge l'Excel dans son run_pipeline.py et copie sa méthode.
+
+2. Vérifie les schémas réels des CSV avant même de lancer Streamlit :
+
+python
+import pandas as pd
+from dq.bootstrap import PROJECT_ROOT
+A = PROJECT_ROOT / "artifacts"
+print(pd.read_csv(A/"run_rules.csv").columns.tolist())
+print(pd.read_csv(A/"run_records.csv").columns.tolist())
+print(pd.read_csv(A/"run_dqi.csv").columns.tolist())
+print(pd.read_csv(A/"coverage.csv").columns.tolist())
+
+Colle-moi la sortie si les noms diffèrent de ce que j'ai supposé (rule_id, column, dimension, pass_rate) et j'ajuste tools.py en 2 min.
+
+3. Test isolé de l'agent avant Streamlit :
+
+python
+from dq.agent.graph import build_agent, run_agent
+agent = build_agent()
+r = run_agent(agent, "What's the DQI of the last run?")
+print(r["messages"][-1].content)
+
+Si ça plante à build_agent() : problème de connexion au LLM (env vars, endpoint). Si ça plante pendant l'invocation : problème de tools.
+
+4. Lance Streamlit :
+
+bash
+streamlit run app/streamlit_app.py
+Deux petits pièges que je vois dans son code
+list_uncovered_columns compare les noms de colonnes FENGO avec les valeurs column des règles. Si tes règles utilisent le Data ID (ex: AAA334) au lieu du nom de colonne FENGO (ex: RMPM ID), le tool va dire que TOUTES les colonnes sont uncovered. Vérifie ce que contient réellement le champ column dans rules.json.
+La sidebar est déclarée AVANT tab_chat dans le fichier, mais Streamlit rend dans l'ordre du script — ça marche, mais le compteur "Pending proposals" ne se rafraîchit pas après une action agent tant que tu ne relances pas manuellement. Pas bloquant pour la démo.
