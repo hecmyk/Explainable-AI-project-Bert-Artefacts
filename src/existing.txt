@@ -1,0 +1,45 @@
+Review the existing rule catalog for redundancy, conflicts, and dead rules.
+
+Steps:
+1. Use list_rules to fetch the full rule catalog (browse by column if truncated).
+2. Group rules by target column and identify:
+   - Duplicates: two rules with the same check_type and equivalent params on the same column.
+   - Overlaps: one rule that is strictly stronger than another (e.g., a stricter allowed_values that makes a weaker one redundant).
+   - Conflicts: two rules that cannot both hold on the same value.
+   - Dead rules: rules whose check_type is unsupported or whose target column doesn't exist in FENGO (use list_uncovered_columns as a cross-check).
+3. For each finding, propose the action via propose_delete_rule or propose_modify_rule with a rationale that names both the redundant rule and the one it duplicates/conflicts with.
+
+Limit to your 3 most impactful proposals. Do NOT propose new rules in this task — that's a different workflow.
+
+
+
+Discover missing rules by mining the dataset for disquality patterns not covered by the current catalog.
+
+Steps:
+1. Use list_uncovered_columns to find FENGO columns with no rule.
+2. Pick the 3 columns you consider highest priority (business importance + likelihood of quality issues).
+3. For each, call profile_column to inspect nulls, uniques, top values, dtype, samples.
+4. Based on the profile, propose ONE candidate rule via propose_add_rule. The spec_json must include:
+   - target_columns: [column_name]
+   - check: {type, params} using one of: not_null, allowed_values, regex, comparison, conditional, cross_field_map, unique
+   - source_text: one-line human-readable description
+5. The rationale MUST cite the specific numbers from profile_column (e.g., "78% nulls suggests not_null with an eligibility filter").
+
+Do not propose more than 3 candidate rules. Do NOT modify or delete existing rules in this task.
+
+
+
+
+Draft Business Data Dictionary definitions for FENGO columns that have no formal definition.
+
+Steps:
+1. Use list_columns_without_definition to get the list.
+2. Pick the 3 most critical (association/entity identifiers first).
+3. For each, call profile_column to ground the definition in the observed data.
+4. Use propose_definition with:
+   - name: canonical business name
+   - definition: one-paragraph business meaning
+   - example: 2-3 sample values from the profile
+   - rationale: explain what you inferred from the data profile
+
+Limit to 3 proposals.
