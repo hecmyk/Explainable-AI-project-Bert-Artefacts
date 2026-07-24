@@ -1,0 +1,13 @@
+python -c "
+from dq.agent.graph import build_agent
+a = build_agent()
+for chunk in a.stream({'messages': [{'role':'user','content':'List columns without a definition.'}]}, config={'recursion_limit': 10}):
+    print(list(chunk.keys()), '---')
+    for k, v in chunk.items():
+        if 'messages' in v:
+            m = v['messages'][-1]
+            if hasattr(m, 'tool_calls') and m.tool_calls:
+                print('  TOOL CALLS:', [tc['name'] for tc in m.tool_calls])
+            elif hasattr(m, 'content') and m.content:
+                print('  CONTENT:', m.content[:200])
+"
