@@ -1,0 +1,89 @@
+Slide 1 — What I built
+
+Title: LLM Agent for Rule Catalog & Definition Management
+
+Subtitle: Human-in-the-loop, built on top of the team's rule engine
+
+Content:
+
+Covers three business objectives from the tickets:
+
+Optimize the existing rule catalog (Ticket 1, Obj. 3)
+Discover new rules from uncovered data patterns (Ticket 1, Obj. 4)
+Draft business definitions for undocumented columns
+
+Guardrail: every agent output goes through a human review queue before activation. No autonomous write to rules.json.
+
+Speaker note (~40 sec):
+"On top of the deterministic rule engine, I built an interactive LLM agent. It addresses three of the objectives in our tickets: reviewing the current rule catalog to flag redundant or dead rules, discovering candidate rules for columns that have no coverage, and drafting business definitions for columns that don't yet appear in the Business Data Dictionary. The core principle: the agent proposes, a human decides. Nothing is applied automatically."
+
+Slide 2 — The agent: what it is and how it works
+
+Title: The Agent
+
+Subtitle: ReAct loop over 9 deterministic tools, orchestrated by LangGraph
+
+Content — 3 blocks:
+
+1. Runtime
+
+Model: gpt-oss-120b-ITG on the internal OpenAI-compatible endpoint
+Framework: LangGraph create_react_agent (Reason + Act loop)
+Per session: system prompt + tool schemas injected at every turn
+Recursion limit: 40 nodes (~20 tool calls max per turn)
+
+2. Tools — the agent's action surface
+
+Read (exploration, no side effect):
+
+list_rules — current catalog, filterable by column / check type
+list_uncovered_columns — FENGO columns with no rule
+list_columns_without_definition — FENGO columns absent from BDD
+profile_column — nulls, uniques, top values, dtype, samples
+get_failures — sample violations for a given rule
+
+Write (all create pending proposals, never mutate live state):
+
+propose_add_rule, propose_modify_rule, propose_delete_rule
+propose_definition
+
+3. Design decisions
+
+LLM only chooses which tool to call and with what arguments
+All business logic (rule loading, profiling, persistence) stays in deterministic Python
+Full trace: every tool call logged to agent_calls.jsonl with timestamp, args, duration
+Every proposal carries a rationale grounded in observed data — required by prompt
+
+Speaker note (~1 min 15 sec):
+"The agent is a standard ReAct loop built with LangGraph. At each turn, the LLM sees the conversation, the system prompt, and the schema of the nine tools it has available. It decides whether to call a tool or answer. We split tools into two groups. Read tools are the agent's eyes — they expose the current rule catalog, the coverage gap, the data profile of any column, and sample failures. Write tools are more restricted: they can only append to a pending queue. None of them mutates the live rule catalog. This separation is important for two reasons. First, governance: every proposition is logged with its rationale and waits for a human. Second, reliability: the LLM only decides what to explore and what to propose. The actual data loading, JSON persistence, coverage computation — all of that is deterministic Python. The agent inherits its trustworthiness from those functions, not from the model. Every tool call is also logged to a JSONL file with duration and arguments — so we get an audit trail for free."
+
+Slide 3 — Interaction & review
+
+Title: From prompt to approval
+
+Content — 2 columns side by side:
+
+Left column: "Agent Chat" tab
+
+3 pre-loaded prompt templates, one per objective:
+Optimize the rule catalog
+Discover missing rules
+Draft missing definitions
+Users can edit any template before sending
+Live streaming: every tool call appears in real time (🔧 name + args, 📥 result size)
+Chat history persisted per session
+
+Right column: "Agent Proposals" tab
+
+Queue of pending proposals from all past agent runs
+Each proposal shows: kind (add / modify / delete / definition), rationale, payload
+Two actions: Approve (logged, ready for future auto-apply) or Reject
+Filterable by status (pending / approved / rejected / all)
+
+Bottom bar:
+
+Persistence: proposals.json (queue) + agent_calls.jsonl (audit)
+POC scope: approvals are logged but not auto-merged back into rules.json — next iteration
+
+Speaker note (~1 min):
+"On the user side, the agent lives in two Streamlit tabs. In Agent Chat, the user picks one of three pre-loaded prompts — each aligned with one user story — edits it if needed, and sends. During execution, the UI streams every tool call live: which tool, with what arguments, and how much data it returned. This makes the agent's reasoning transparent. When the run finishes, all proposals appear in the Agent Proposals tab, sorted by status. The reviewer sees the rationale, the exact payload, and clicks Approve or Reject. Approval is logged in a proposals file for auditability. In this POC we intentionally stopped short of auto-applying approved proposals back into the rule catalog — that's the natural next step, but the guardrail requirement was the priority."
