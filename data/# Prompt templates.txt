@@ -1,0 +1,100 @@
+# Prompt templates
+PROMPT_OPTIMIZE = """Review the existing rule catalog for redundancy, conflicts, and dead rules.
+
+Steps:
+1. Use list_rules to fetch the full rule catalog (browse by column if truncated).
+2. Group rules by target column and identify:
+   - Duplicates: two rules with the same check_type and equivalent params on the same column.
+   - Overlaps: one rule that is strictly stronger than another.
+   - Conflicts: two rules that cannot both hold on the same value.
+   - Dead rules: rules whose check_type is unsupported or whose target column doesn't exist in FENGO (use list_uncovered_columns as a cross-check).
+3. For each finding, propose the action via propose_delete_rule or propose_modify_rule with a rationale that names both the redundant rule and the one it duplicates/conflicts with.
+
+Limit to your 3 most impactful proposals. Do NOT propose new rules in this task."""
+
+PROMPT_DISCOVER = """Discover missing rules by mining the dataset for disquality patterns not covered by the current catalog.
+
+Steps:
+1. Use list_uncovered_columns to find FENGO columns with no rule.
+2. Pick the 3 columns you consider highest priority (business importance + likelihood of quality issues).
+3. For each, call profile_column to inspect nulls, uniques, top values, dtype, samples.
+4. Based on the profile, propose ONE candidate rule via propose_add_rule. The spec_json must include:
+   - target_columns: [column_name]
+   - check: {type, params} using one of: not_null, allowed_values, regex, comparison, conditional, cross_field_map, unique
+   - source_text: one-line human-readable description
+5. The rationale MUST cite the specific numbers from profile_column.
+
+Do not propose more than 3 candidate rules."""
+
+PROMPT_DEFINITIONS = """Draft Business Data Dictionary definitions for FENGO columns that have no formal definition.
+
+Steps:
+1. Use list_columns_without_definition to get the list.
+2. Pick the 3 most critical (association/entity identifiers first).
+3. For each, call profile_column to ground the definition in the observed data.
+4. Use propose_definition with:
+   - name: canonical business name
+   - definition: one-paragraph business meaning
+   - example: 2-3 sample values from the profile
+   - rationale: explain what you inferred from the data profile
+
+Limit to 3 proposals."""
+
+
+def _set_composer(text):
+    st.session_state.composer = text
+
+
+with tab_chat:
+    st.title("Agent Chat")
+    st.session_state.setdefault("chat", [])
+    st.session_state.setdefault("composer", "")
+
+    with st.expander("📋 Prompt templates (click to load, then edit)", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        c1.button("1. Optimize rules", on_click=_set_composer,
+                  args=(PROMPT_OPTIMIZE,), use_container_width=True)
+        c2.button("2. Discover rules", on_click=_set_composer,
+                  args=(PROMPT_DISCOVER,), use_container_width=True)
+        c3.button("3. Draft definitions", on_click=_set_composer,
+                  args=(PROMPT_DEFINITIONS,), use_container_width=True)
+
+    for msg in st.session_state.chat:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    prompt_text = st.text_area("Message", height=200, key="composer",
+                               placeholder="Type or load a template above...")
+    send = st.button("Send", type="primary", disabled=not prompt_text.strip())
+
+    if send and prompt_text.strip():
+        prompt = prompt_text
+        st.session_state.chat.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+
+        with st.chat_message("assistant"):
+            status = st.status("Thinking...", expanded=True)
+            final_content = ""
+            try:
+                for chunk in stream_agent(get_agent(), prompt,
+                                          history=st.session_state.chat[:-1]):
+                    for node_name, node_output in chunk.items():
+                        msgs = node_output.get("messages", []) if isinstance(node_output, dict) else []
+                        for m in msgs:
+                            tcs = getattr(m, "tool_calls", None)
+                            if tcs:
+                                for tc in tcs:
+                                    args_str = json.dumps(tc.get("args", {}))[:120]
+                                    status.write(f"🔧 `{tc['name']}({args_str})`")
+                            elif getattr(m, "type", None) == "tool":
+                                name = getattr(m, "name", "tool")
+                                status.write(f"📥 `{name}` returned {len(str(m.content))} chars")
+                            elif getattr(m, "type", None) == "ai" and getattr(m, "content", ""):
+                                final_content = m.content
+            except Exception as e:
+                status.update(label=f"Error: {e}", state="error")
+                final_content = f"Error: {e}"
+            else:
+                status.update(label="Done", state="complete", expanded=False)
+            st.write(final_content)
+
+        st.session_state.chat.append({"role": "assistant", "content": final_content})
