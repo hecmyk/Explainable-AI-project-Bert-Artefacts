@@ -1,0 +1,90 @@
+Slide 1 — What I built
+
+Title: LLM Agent for Rule Catalog & Definition Management
+
+Subtitle: Human-in-the-loop, built on top of the team's rule engine
+
+Bullets:
+
+Covers Ticket 1 objectives 3 & 4: optimize existing rules, discover new ones
+Plus: drafts business definitions for undocumented columns
+All agent outputs go through a human review queue before activation
+
+Speaker note (~30 sec):
+"On top of the deterministic rule engine my teammates built, I added an interactive LLM agent that helps a data quality owner improve the catalog. It handles three tasks: finding redundant or dead rules, proposing new rules for uncovered columns, and drafting definitions for columns that don't yet have one. Nothing is applied automatically — every agent output waits for a human decision."
+
+Slide 2 — Architecture
+
+Title: Architecture
+
+Visual — simple horizontal flow:
+
+User (chat)
+   ↓
+Agent  ──  gpt-oss-120b-ITG  (ReAct loop, LangGraph)
+   ↓
+9 Tools (Python, deterministic)
+   ├─ Read: list_rules, list_uncovered_columns,
+   │        list_columns_without_definition, profile_column,
+   │        get_failures
+   └─ Write: propose_add_rule, propose_modify_rule,
+            propose_delete_rule, propose_definition
+   ↓
+proposals.json  (pending queue)
+   ↓
+Streamlit review UI  →  Approve / Reject
+
+Key design points (2 bullets on slide):
+
+LLM chooses which tools to call — all business logic stays in deterministic Python
+Write tools never touch rules.json directly; they append to a pending queue
+
+Speaker note (~1 min):
+"The user chats with the agent in a Streamlit tab. Under the hood it's a ReAct loop built with LangGraph. The agent has access to nine tools, split into read tools that expose the current state — the rule catalog, the data profile, the coverage matrix — and write tools that create proposals. The write tools never mutate the rule catalog directly; they append to a pending queue. That queue is the single control point where the human decides what actually happens. This satisfies the governance requirement in the ticket: no AI-proposed change is activated without a logged human approval."
+
+Slide 3 — Live demo
+
+Title: Demo
+
+Content on slide:
+
+3 pre-loaded prompts, one per business objective:
+Optimize the rule catalog
+Discover missing rules
+Draft missing definitions
+User can edit each prompt before sending
+
+Screenshot: the Agent Proposals tab showing 3 pending propositions with rationale.
+
+Speaker note + demo (~1.5 min):
+"Let me show it live. In the Agent Chat tab I have three pre-built prompts — one per user story. I click 'Optimize rules'."
+
+→ [send the prompt]
+
+"You can see the agent's tool calls in real time — it lists the rules, cross-checks against uncovered columns, then submits three delete proposals."
+
+→ [switch to Agent Proposals tab]
+
+"Each proposition carries a rationale grounded in what the agent observed — here it flagged two dead rules and one duplicate. I approve or reject."
+
+→ [click Approve on one]
+
+"The approval is logged. Applying approved proposals back to rules.json is the next iteration — kept out of this POC to stay within the guardrail scope."
+
+
+
+
+
+# Backup ton proposals.json actuel au cas où
+cp data-quality-rules/artifacts/proposals.json /tmp/proposals_backup.json
+
+# Supprime-le pour libérer le pull
+rm data-quality-rules/artifacts/proposals.json
+
+# Pull
+git pull origin data-quality-rules
+
+
+
+# Recolle ta version après le pull
+cp /tmp/proposals_backup.json data-quality-rules/artifacts/proposals.json
