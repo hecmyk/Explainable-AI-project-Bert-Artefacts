@@ -1,0 +1,22 @@
+python -c "from dq.agent.tools import ALL_TOOLS; print(len(ALL_TOOLS))"
+# Doit sortir 10
+python -c "from dq.agent.graph import build_agent, stream_agent, run_agent; print('ok')"
+python -c "import app.streamlit_app" 
+# Le dernier va planter parce que Streamlit doit être run, pas importé — c'est normal, ignore. Mais vérifie qu'il n'y a pas d'ImportError sur les imports en haut.
+
+
+
+python -c "
+from dq.agent.graph import build_agent, stream_agent
+a = build_agent()
+for chunk in stream_agent(a, 'How many rules are there?'):
+    print('---', list(chunk.keys()))
+"
+
+
+
+cat artifacts/agent_calls.jsonl
+
+
+
+streamlit run app/streamlit_app.py
