@@ -1,0 +1,59 @@
+"""Phase C — LLM title leveling.
+
+assign_title_levels makes ONE Mistral call to assign a hierarchy level (1-4) to each
+document title, so dom_build can nest its flat section list. It is injected into
+build_dom (title_leveler=...) and kept deliberately independent of the prototype agent:
+its own OpenAI client, its own short prompt, no shared state, no prompts.yaml coupling.
+"""
+
+import json
+import logging
+
+from openai import OpenAI
+
+from config import MISTRAL_AGENT_MODEL, MISTRAL_API_KEY, MISTRAL_BASE_URL
+
+logger = logging.getLogger(__name__)
+
+client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY)
+MODEL = MISTRAL_AGENT_MODEL
+
+_SYSTEM_PROMPT = (
+    "You assign a hierarchy level to every title of a financial document.\n"
+    "Levels are integers from 1 (top, e.g. Part) to 4 (deepest, e.g. sub-subsection). "
+    "Infer depth from the title text, its numbering, and its reading order. "
+    "Never output a level below 1 or above 4: if a title looks deeper than 4, clamp it "
+    "to 4 or drop it.\n"
+    "Input is a JSON array of {\"title_id\", \"text\", \"page\"} in reading order.\n"
+    "Reply with ONLY a JSON object mapping each title_id to its integer level, e.g. "
+    "{\"p0_e1\": 1, \"p3_e0\": 2}. No prose, no markdown code fences."
+)
+
+
+def assign_title_levels(titles: list[dict]) -> dict[str, int] | None:
+    """Return {title_id: level} from one Mistral call, or None on any failure.
+
+    Args:
+        titles: Ordered list of {"title_id", "text", "page"} for the document titles.
+
+    Returns:
+        A raw mapping from title_id to an LLM-proposed level (validation of id/range is
+        the caller's job), or None if the call or its JSON parsing failed (the caller
+        then falls back to level 1 for every title).
+    """
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(titles, ensure_ascii=False)},
+            ],
+        )
+        content = (response.choices[0].message.content or "").strip()
+        # Sole guardrail: drop ```json / ``` fences if the model wrapped its JSON.
+        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as exc:  # network, bad JSON, unexpected shape — all fall back to L1
+        logger.warning(f"title leveling failed, falling back to L1: {exc}")
+        return None
