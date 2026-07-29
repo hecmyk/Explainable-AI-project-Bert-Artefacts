@@ -1,0 +1,198 @@
+EXTRA_TABLE_TOC_IDS = {
+    "1261719": [],
+    "1782033": ["p3_e2"],
+}
+
+def load_doc_artifacts(doc_id):
+    """Charge doc_ocr.json et doc_dom.json pour un doc."""
+    doc_dir = DOCS_DIR / doc_id
+    with open(doc_dir / "doc_ocr.json") as f:
+        doc_ocr = json.load(f)
+    with open(doc_dir / "doc_dom.json") as f:
+        dom = json.load(f)
+    return doc_ocr, dom
+
+
+
+def build_gold(doc_ocr, extra_table_toc_ids):
+    """Récupère les textes des atomes label='content' + les tables sommaires
+    ajoutées à la main. Retourne une liste ordonnée de titres (chaînes)."""
+    entries = []   # (page, e_idx, text)
+    for page_key, items in doc_ocr.items():
+        page = int(page_key.split("_")[1])
+        for e_idx, item in enumerate(items):
+            atom_id = f"p{page}_e{e_idx}"
+            is_toc_content = item["label"] == "content"
+            is_extra_table = atom_id in extra_table_toc_ids
+            if is_toc_content or is_extra_table:
+                text = (item.get("text") or "").strip()
+                if text:
+                    entries.append((page, e_idx, text))
+    entries.sort(key=lambda t: (t[0], t[1]))
+    return [text for _, _, text in entries]
+
+
+
+def build_mine(dom):
+    """Parcourt le DOM en ordre de lecture (via l'index) et récupère les
+    titres de sections avec leur niveau. Retourne [{title, level, source}]."""
+    index = dom["index"]
+
+    # Aplatir le tree pour parcourir les sections en ordre.
+    def walk(sections):
+        for s in sections:
+            yield s
+            yield from walk(s["subsections"])
+
+    mine = []
+    for sec in walk(dom["tree"]["sections"]):
+        if sec["title_id"] is None or not sec["title"]:
+            continue
+        mine.append({
+            "title": sec["title"],
+            "level": sec["level"],
+            "source": sec["level_source"],
+        })
+    return mine
+
+
+def leveling_stats(mine):
+    """Retourne (%_llm, %_fallback) pour vérifier que le lot 4 a marché."""
+    if not mine:
+        return 0.0, 0.0
+    n = len(mine)
+    n_llm = sum(1 for m in mine if m["source"] == "llm")
+    n_fb = n - n_llm
+    return 100 * n_llm / n, 100 * n_fb / n
+
+
+
+
+
+
+
+
+_MATCHER_SYSTEM = (
+    "You are a text alignment tool. You align two ordered lists of section "
+    "titles from the SAME financial document.\n"
+    "- GOLD: titles extracted from the document's table(s) of contents. The "
+    "same title MAY appear multiple times (global TOC + per-part TOCs).\n"
+    "- MINE: titles produced by an OCR + layout pipeline, with hierarchy "
+    "levels 1 to 4.\n"
+    "For each GOLD item, find the MINE item that matches (same title, "
+    "allowing OCR noise: spacing, punctuation, diacritics, minor char errors)."
+    " Alignment is roughly monotone but repeated GOLD titles may re-match an "
+    "earlier MINE index.\n"
+    "If no MINE item plausibly matches a GOLD item, use null.\n"
+    "Reply with ONLY a JSON object, no prose, no markdown fences, of shape:\n"
+    '{"matches":[{"gold_idx":0,"mine_idx":2},{"gold_idx":1,"mine_idx":null},...]}\n'
+    "The matches array must contain exactly one entry per GOLD item, in "
+    "gold_idx order."
+)
+
+
+def match_gold_to_mine(gold, mine):
+    """Un appel LLM. Retourne la liste des matches ou None si échec."""
+    gold_str = "\n".join(f"{i}: {t}" for i, t in enumerate(gold))
+    mine_str = "\n".join(f"{i}: [L{m['level']}] {m['title']}"
+                        for i, m in enumerate(mine))
+    user = f"GOLD (numbered from 0):\n{gold_str}\n\nMINE (numbered from 0):\n{mine_str}"
+
+    try:
+        response = client.chat.completions.create(
+            model=JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": _MATCHER_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = (response.choices[0].message.content or "").strip()
+        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(content)
+        return parsed.get("matches")
+    except Exception as exc:
+        print(f"  ! matcher failed: {exc}")
+        return None
+
+
+
+
+
+
+def compute_metrics(matches, gold_len):
+    """recall, ordre_préservé."""
+    if not matches:
+        return {"recall": 0.0, "order_preserved": None}
+
+    matched_mine_idxs = [m["mine_idx"] for m in matches if m["mine_idx"] is not None]
+    recall = len(matched_mine_idxs) / gold_len if gold_len else 0.0
+
+    # Ordre : dédoublonne en gardant la 1re occurrence, vérifie strictement croissant.
+    seen = []
+    for idx in matched_mine_idxs:
+        if idx not in seen:
+            seen.append(idx)
+    order_preserved = all(seen[i] < seen[i + 1] for i in range(len(seen) - 1))
+
+    return {"recall": round(recall, 3), "order_preserved": order_preserved}
+
+
+
+
+results = {}
+
+for doc_id in DOC_IDS:
+    print(f"\n=== {doc_id} ===")
+    doc_ocr, dom = load_doc_artifacts(doc_id)
+
+    extra = EXTRA_TABLE_TOC_IDS.get(doc_id, [])
+    gold = build_gold(doc_ocr, extra)
+    print(f"  gold titles     : {len(gold)}")
+
+    mine = build_mine(dom)
+    pct_llm, pct_fb = leveling_stats(mine)
+    print(f"  mine titles     : {len(mine)}")
+    print(f"  leveling source : {pct_llm:.1f}% llm | {pct_fb:.1f}% fallback")
+    print(f"  header flag     : {dom['header']['title_leveling']}")
+
+    if not gold or not mine:
+        print("  ! empty gold or mine, skipping matcher")
+        results[doc_id] = None
+        continue
+
+    matches = match_gold_to_mine(gold, mine)
+    metrics = compute_metrics(matches, len(gold))
+    print(f"  recall          : {metrics['recall']}")
+    print(f"  order preserved : {metrics['order_preserved']}")
+
+    results[doc_id] = {
+        "gold_len": len(gold),
+        "mine_len": len(mine),
+        "pct_llm": pct_llm,
+        "pct_fallback": pct_fb,
+        "header_flag": dom["header"]["title_leveling"],
+        **metrics,
+        "matches": matches,
+    }
+
+
+
+
+
+
+
+
+valid = [r for r in results.values() if r is not None]
+if valid:
+    avg_recall = sum(r["recall"] for r in valid) / len(valid)
+    n_order_ok = sum(1 for r in valid if r["order_preserved"])
+    avg_llm = sum(r["pct_llm"] for r in valid) / len(valid)
+    print(f"\n=== SUMMARY ({len(valid)} docs) ===")
+    print(f"  avg recall           : {avg_recall:.3f}")
+    print(f"  order preserved      : {n_order_ok}/{len(valid)}")
+    print(f"  avg %% llm leveling   : {avg_llm:.1f}%")
+
+
+
+
+
