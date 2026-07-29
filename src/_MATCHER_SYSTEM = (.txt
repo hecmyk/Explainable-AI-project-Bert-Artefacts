@@ -1,0 +1,138 @@
+_MATCHER_SYSTEM = (
+    "You compare the table of contents of a financial document (GOLD) with "
+    "titles produced by an OCR + layout pipeline (MINE).\n"
+    "\n"
+    "GOLD is the raw OCR text of the document's TOC — one or more paragraphs "
+    "possibly containing dot-leaders, page numbers, part headers, and other "
+    "noise. Your first job is to extract from GOLD the ordered list of TOC "
+    "entries (titles only, no page numbers, no dot-leaders, no 'Page' labels). "
+    "The same title MAY appear multiple times (global TOC + per-part TOCs) — "
+    "keep every occurrence in reading order.\n"
+    "\n"
+    "MINE is an ordered list of section titles with hierarchy levels 1 to 4, "
+    "one per line, numbered from 0.\n"
+    "\n"
+    "For each GOLD entry you extract, find the MINE item that matches (same "
+    "title, allowing OCR noise: spacing, punctuation, diacritics, minor char "
+    "errors). If no plausible match, use null. Alignment is roughly monotone "
+    "but repeated GOLD entries may re-match earlier MINE indices.\n"
+    "\n"
+    "Reply with ONLY a JSON object, no prose, no fences, of shape:\n"
+    '{\n'
+    '  "gold_entries": ["Item 1. Business", "PART I", ...],\n'
+    '  "matches": [{"gold_idx": 0, "mine_idx": 3}, {"gold_idx": 1, "mine_idx": null}, ...]\n'
+    '}\n'
+    "gold_entries has one string per TOC entry you extracted, in order. "
+    "matches has exactly one entry per gold_idx (0..len(gold_entries)-1)."
+)
+
+
+
+
+
+
+def parse_and_match(gold_blob, mine):
+    """Un appel LLM. Le LLM parse GOLD ET aligne à MINE.
+    Retourne (gold_entries, matches) ou (None, None) si échec."""
+    mine_str = "\n".join(f"{i}: [L{m['level']}] {m['title']}"
+                        for i, m in enumerate(mine))
+    user = f"GOLD (raw TOC OCR text):\n{gold_blob}\n\nMINE (numbered from 0):\n{mine_str}"
+
+    try:
+        response = client.chat.completions.create(
+            model=JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": _MATCHER_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = (response.choices[0].message.content or "").strip()
+        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(content)
+        return parsed.get("gold_entries"), parsed.get("matches")
+    except Exception as exc:
+        print(f"  ! matcher failed: {exc}")
+        return None, None
+
+
+
+
+
+
+
+
+def build_gold(doc_ocr, extra_table_toc_ids):
+    """Concat brute des atomes `content` + tables sommaires extra, en ordre
+    de lecture. Le LLM parsera lui-même."""
+    entries = []
+    for page_key, items in doc_ocr.items():
+        page = int(page_key.split("_")[1])
+        for e_idx, item in enumerate(items):
+            atom_id = f"p{page}_e{e_idx}"
+            if item["label"] == "content" or atom_id in extra_table_toc_ids:
+                text = (item.get("text") or "").strip()
+                if text:
+                    entries.append((page, e_idx, text))
+    entries.sort(key=lambda t: (t[0], t[1]))
+    return "\n\n".join(text for _, _, text in entries)
+
+
+
+
+
+
+def compute_metrics(matches, gold_len):
+    if not matches or gold_len == 0:
+        return {"recall": 0.0, "order_preserved": None}
+
+    # Ne garde qu'une entrée par gold_idx dans les bornes (défensif)
+    seen_gold = set()
+    unique = []
+    for m in matches:
+        gi = m.get("gold_idx")
+        if gi is not None and gi not in seen_gold and 0 <= gi < gold_len:
+            seen_gold.add(gi)
+            unique.append(m)
+
+    matched_mine_idxs = [m["mine_idx"] for m in unique if m["mine_idx"] is not None]
+    recall = min(1.0, len(matched_mine_idxs) / gold_len)   # borne dure
+
+    seen = []
+    for idx in matched_mine_idxs:
+        if idx not in seen:
+            seen.append(idx)
+    order_preserved = all(seen[i] < seen[i + 1] for i in range(len(seen) - 1))
+
+    return {"recall": round(recall, 3), "order_preserved": order_preserved}
+
+
+
+
+
+
+gold_blob = build_gold(doc_ocr, extra)
+print(f"  gold blob length: {len(gold_blob)} chars")   # sanity check
+
+# ...
+
+gold_entries, matches = parse_and_match(gold_blob, mine)
+if gold_entries is None:
+    print("  ! matcher failed, skipping")
+    results[doc_id] = None
+    continue
+
+print(f"  gold entries    : {len(gold_entries)}")
+metrics = compute_metrics(matches, len(gold_entries))
+print(f"  recall          : {metrics['recall']}")
+print(f"  order preserved : {metrics['order_preserved']}")
+
+results[doc_id] = {
+    "gold_len": len(gold_entries),
+    "mine_len": len(mine),
+    "pct_llm": pct_llm,
+    "pct_fallback": pct_fb,
+    "header_flag": dom["header"]["title_leveling"],
+    **metrics,
+    "gold_entries": gold_entries,   # pour débuguer plus tard
+    "matches": matches,
+}
