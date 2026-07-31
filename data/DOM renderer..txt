@@ -1,0 +1,247 @@
+"""DOM renderer.
+
+build_outline_xml turns a build_dom output into an indented XML skeleton meant to be the
+FIRST-TURN input of the agent: structure only, no inlined body text. The agent navigates
+it with its tools (get_section / search) using the ids it reads here, so every id emitted
+must be resolvable in dom["index"] (visual atoms) or in the section tree (sections).
+
+No degradation cascade in v0: the keyword-only parameters exist so a future calling layer
+can shrink the skeleton without rewriting the renderer. Chrome is never rendered (the dom
+already keeps it in its own bucket) and caption chains are never walked (build_dom already
+flattens them onto the root visual).
+"""
+
+import logging
+import re
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape, quoteattr
+
+logger = logging.getLogger(__name__)
+
+_INDENT = "  "
+_FIGURE_LABELS = {"figure", "chart", "image"}
+
+# Preview/caption tuning. _PREVIEW_SCAN_LIMIT bounds the children walk so a giant implicit
+# 's_toc' (a title-less document collapses ALL its atoms into it) stays cheap.
+_PREVIEW_SCAN_LIMIT = 50
+_PREVIEW_HARD_MARGIN = 40
+_CAPTION_CHARS = 80
+_CAPTION_HARD_MARGIN = 20
+
+# Control characters that are illegal in XML 1.0 even once escaped: they would make the
+# final parse check (and the agent's own parser) fail, so they are dropped before escaping.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _strip_control_chars(text: str) -> str:
+    return _CONTROL_CHARS.sub("", text)
+
+
+def _clean_text(text: str | None) -> str:
+    """Drop illegal control chars and collapse OCR whitespace to single spaces."""
+    return _WHITESPACE.sub(" ", _strip_control_chars(text or "")).strip()
+
+
+def _truncate(text: str, soft: int, hard: int) -> str:
+    """Snap to the last space at or before soft; fall back to a blunt cut at hard."""
+    if len(text) <= soft:
+        return text
+    cut = text.rfind(" ", 0, soft + 1)
+    if cut <= 0:
+        if len(text) <= hard:
+            return text
+        cut = hard
+    return text[:cut].rstrip() + "..."
+
+
+def _fmt_attrs(pairs: list[tuple[str, object]]) -> str:
+    """Attribute string; quoteattr both quotes and escapes, so no separate escape()."""
+    return " ".join(f"{name}={quoteattr(str(value))}" for name, value in pairs)
+
+
+def _fmt_pages(section: dict) -> str | None:
+    """"5-12", or "5" for a single page; None when the section has no page territory."""
+    start, end = section["page_start"], section["page_end"]
+    if start is None:
+        return None
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def _count_children_by_role(children: list[str], index: dict) -> tuple[int, int, int]:
+    """(n_content, n_tables, n_figures). Captions are routed as content by build_dom but
+    excluded here: their text already surfaces in the visual placeholder."""
+    n_content = n_tables = n_figures = 0
+    for atom_id in children:
+        atom = index[atom_id]
+        if atom["role"] == "content":
+            if "caption_of" not in atom:
+                n_content += 1
+        elif atom["label"] == "table":
+            n_tables += 1
+        elif atom["label"] in _FIGURE_LABELS:
+            n_figures += 1
+    return n_content, n_tables, n_figures
+
+
+def _build_preview(children: list[str], index: dict, preview_chars: int) -> str | None:
+    """First content text of the section body, or None when it has no usable text.
+
+    Empty text is normal (image/chart are never OCRed, and a failed OCR call yields an
+    empty text plus an ocr_error), so the walk SKIPS empties instead of stopping on them.
+    """
+    hard = preview_chars + _PREVIEW_HARD_MARGIN
+    chunks: list[str] = []
+    length = 0
+    for atom_id in children[:_PREVIEW_SCAN_LIMIT]:
+        atom = index[atom_id]
+        if atom["role"] != "content" or "caption_of" in atom:
+            continue
+        text = _clean_text(atom.get("text"))
+        if not text:
+            continue
+        chunks.append(text)
+        length += len(text) + 1
+        if length >= hard:
+            break
+    if not chunks:
+        return None
+    return _truncate(" ".join(chunks), preview_chars, hard)
+
+
+def _first_caption_text(visual_id: str, caption_map: dict, index: dict) -> str:
+    """Text of the first non-empty caption of a visual, truncated; "(none)" if it has no
+    caption. A visual can carry several (a V -> C1 -> C2 chain resolves both onto V)."""
+    for caption_id in caption_map.get(visual_id, ()):
+        text = _clean_text(index[caption_id].get("text"))
+        if text:
+            return _truncate(text, _CAPTION_CHARS, _CAPTION_CHARS + _CAPTION_HARD_MARGIN)
+    return "(none)"
+
+
+def _render_visual(atom: dict, caption_map: dict, index: dict, depth: int) -> str:
+    caption = _first_caption_text(atom["id"], caption_map, index)
+    attrs: list[tuple[str, object]] = [
+        ("id", atom["id"]),
+        ("page", atom["page"]),
+        ("caption", caption),
+    ]
+    if atom["label"] == "table":
+        tag = "table"
+    else:
+        tag = "figure"
+        attrs.append(("kind", atom["label"]))   # figure / chart / image
+    return f"{_INDENT * depth}<{tag} {_fmt_attrs(attrs)}/>"
+
+
+def _render_visuals(children: list[str], index: dict, caption_map: dict, depth: int,
+                    max_visuals: int | None) -> list[str]:
+    visuals = [index[a] for a in children if index[a]["role"] == "visual"]
+    shown = visuals if max_visuals is None else visuals[:max_visuals]
+    lines = [_render_visual(v, caption_map, index, depth) for v in shown]
+    hidden = len(visuals) - len(shown)
+    if hidden:
+        lines.append(f"{_INDENT * depth}<!-- +{hidden} more visuals -->")
+    return lines
+
+
+def _render_section(section: dict, index: dict, caption_map: dict, depth: int,
+                    preview_chars: int, max_depth: int | None, include_visuals: bool,
+                    max_visuals_per_section: int | None) -> list[str]:
+    """Lines for one section and its subtree. depth is 1-based (sections sit one indent
+    below the root), so it doubles as the indent level."""
+    pad = _INDENT * depth
+    children = section["children"]
+    n_content, n_tables, n_figures = _count_children_by_role(children, index)
+
+    attrs: list[tuple[str, object]] = [
+        ("id", section["section_id"]),
+        ("level", section["level"]),
+    ]
+    pages = _fmt_pages(section)
+    if pages is not None:
+        attrs.append(("pages", pages))
+    if section["section_id"] == "s_toc":
+        attrs.append(("kind", "front_matter"))
+    # title_id, not title, tells a real opener from the implicit holder: an opener whose
+    # OCR came back empty also has title None, and gets no placeholder title either.
+    if section["title_id"] is not None:
+        title = _clean_text(section["title"])
+        if title:
+            attrs.append(("title", title))
+    attrs += [("n_content", n_content), ("n_tables", n_tables), ("n_figures", n_figures)]
+    head = f"{pad}<section {_fmt_attrs(attrs)}"
+
+    body: list[str] = []
+    if max_depth is None or depth < max_depth:
+        preview = _build_preview(children, index, preview_chars)
+        if preview:
+            body.append(f"{pad}{_INDENT}<preview>{escape(preview)}</preview>")
+        if include_visuals:
+            body += _render_visuals(children, index, caption_map, depth + 1,
+                                    max_visuals_per_section)
+        for sub in section["subsections"]:
+            body += _render_section(sub, index, caption_map, depth + 1, preview_chars,
+                                    max_depth, include_visuals, max_visuals_per_section)
+
+    if not body:
+        return [f"{head}/>"]
+    return [f"{head}>", *body, f"{pad}</section>"]
+
+
+def build_outline_xml(
+    dom: dict,
+    *,
+    preview_chars: int = 120,
+    max_depth: int | None = None,
+    include_visuals: bool = True,
+    max_visuals_per_section: int | None = None,
+) -> str:
+    """Render a doc_dom as an indented XML skeleton for the agent's first turn.
+
+    Args:
+        dom: build_dom output ({header, index, chrome, tree}).
+        preview_chars: soft target length of a <preview> (snapped to a word boundary).
+        max_depth: deepest section nesting level to expand; a section AT that depth is
+            still emitted, but attribute-only (no preview, no visuals, no subsections).
+            None expands everything.
+        include_visuals: emit the <table>/<figure> placeholders.
+        max_visuals_per_section: cap on placeholders per section, the rest collapsing into
+            an XML comment. None means no cap.
+
+    Returns:
+        The indented XML string, rooted at <document_skeleton>.
+
+    No degradation cascade in v0: the parameters exist so a future calling layer can size
+    the skeleton down without a rewrite.
+    """
+    header, index, tree = dom["header"], dom["index"], dom["tree"]
+
+    # Reverse the caption links once: the dom only stores caption -> visual, on the caption
+    # atom. index is in insertion (= reading) order, so each list comes out ordered.
+    caption_map: dict[str, list[str]] = {}
+    for atom_id, atom in index.items():
+        target = atom.get("caption_of")
+        if target:
+            caption_map.setdefault(target, []).append(atom_id)
+
+    root_attrs: list[tuple[str, object]] = [("doc_id", header["doc_id"] or "unknown")]
+    root_title = _clean_text(tree["title"])
+    if root_title:
+        root_attrs.append(("title", root_title))
+    root_attrs += [
+        ("pages", header["page_count"]),
+        ("n_sections", header["stats"]["n_sections"]),   # flat count, s_toc included
+        ("toc_present", "true" if header["toc_present"] else "false"),
+    ]
+
+    lines = [f"<document_skeleton {_fmt_attrs(root_attrs)}>"]
+    for section in tree["sections"]:
+        lines += _render_section(section, index, caption_map, 1, preview_chars,
+                                 max_depth, include_visuals, max_visuals_per_section)
+    lines.append("</document_skeleton>")
+
+    xml = "\n".join(lines)
+    logger.info(f"skeleton_xml: {len(xml)} chars, ~{len(xml) // 4} tokens")
+    ElementTree.fromstring(xml)   # self-check: never hand the agent unparseable XML
+    return xml
