@@ -1,0 +1,74 @@
+def _is_visible_visual(atom: dict, caption_map: dict) -> bool:
+    """An `image` with no caption is almost always a logo or a decorative band, so it is
+    dropped from BOTH the placeholders and n_figures. chart/figure are always kept: an
+    uncaptioned one is usually a real graphic whose caption the detection missed."""
+    return atom["label"] != "image" or atom["id"] in caption_map
+
+
+def _count_children_by_role(children: list[str], index: dict,
+                            caption_map: dict) -> tuple[int, int, int]:
+
+
+
+def _count_children_by_role(children: list[str], index: dict,
+                            caption_map: dict) -> tuple[int, int, int]:
+    """(n_content, n_tables, n_figures). Captions are routed as content by build_dom but
+    excluded here: their text already surfaces in the visual placeholder. Counts match
+    what is rendered, so a filtered-out logo is not counted either."""
+    n_content = n_tables = n_figures = 0
+    for atom_id in children:
+        atom = index[atom_id]
+        if atom["role"] == "content":
+            if "caption_of" not in atom:
+                n_content += 1
+        elif atom["label"] == "table":
+            n_tables += 1
+        elif atom["label"] in _FIGURE_LABELS:
+            if _is_visible_visual(atom, caption_map):
+                n_figures += 1
+    return n_content, n_tables, n_figures
+
+
+def _render_visual(atom: dict, caption_map: dict, index: dict, depth: int) -> str:
+    caption = _first_caption_text(atom["id"], caption_map, index)
+    attrs: list[tuple[str, object]] = [
+        ("id", atom["id"]),
+        ("page", atom["page"]),
+        ("caption", caption),
+    ]
+    if atom["label"] == "table":
+        tag = "table"
+    else:
+        tag = "figure"
+        attrs.append(("kind", atom["label"]))   # figure / chart / image
+    return f"{_INDENT * depth}<{tag} {_fmt_attrs(attrs)}/>"
+
+
+
+def _render_section(section: dict, index: dict, caption_map: dict, depth: int,
+                    preview_chars: int, max_depth: int | None, include_visuals: bool,
+                    max_visuals_per_section: int | None) -> list[str]:
+    """Lines for one section and its subtree. depth is 1-based (sections sit one indent
+    below the root), so it doubles as the indent level."""
+    pad = _INDENT * depth
+    children = section["children"]
+    n_content, n_tables, n_figures = _count_children_by_role(children, index, caption_map)
+
+    attrs: list[tuple[str, object]] = [
+        ("id", section["section_id"]),
+        ("level", section["level"]),
+    ]
+    pages = _fmt_pages(section)
+    if pages is not None:
+        attrs.append(("pages", pages))
+    if section["section_id"] == "s_toc":
+        attrs.append(("kind", "front_matter"))
+    # title_id, not title, tells a real opener from the implicit holder: an opener whose
+
+
+def build_outline_xml(
+    dom: dict,
+    *,
+    preview_chars: int = 120,
+    max_depth: int | None = None,
+    include_visuals: bool = True,
