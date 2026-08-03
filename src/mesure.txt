@@ -1,0 +1,69 @@
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+import tiktoken
+
+REPO = 
+
+sys.path.insert(0, str(REPO))
+from dom_render import build_outline_xml
+
+enc = tiktoken.get_encoding("cl100k_base")
+
+def walk(sections):
+    for s in sections:
+        yield s
+        yield from walk(s["subsections"])
+
+rows = []
+for path in sorted(REPO.glob("**/doc_dom.json")):
+    doc_id = path.parent.name
+    dom = json.loads(path.read_text())
+    header, index = dom["header"], dom["index"]
+    page_area = {p["index"]: p["width"] * p["height"] for p in header["pages"]}
+
+    xml = build_outline_xml(dom)
+    n_tokens = len(enc.encode(xml))
+
+    levels = Counter(s["level"] for s in walk(dom["tree"]["sections"]))
+
+    # Images sans caption + surface relative
+    caption_targets = {a["caption_of"] for a in index.values() if a.get("caption_of")}
+    img_surfaces = []  # surface relative des images sans caption
+    for a in index.values():
+        if a.get("label") == "image" and a["id"] not in caption_targets:
+            x1, y1, x2, y2 = a["bbox"]
+            pa = page_area.get(a["page"], 0)
+            img_surfaces.append((x2-x1)*(y2-y1)/pa if pa else 0)
+
+    rows.append({
+        "doc_id": doc_id,
+        "pages": header["page_count"],
+        "n_sections": sum(levels.values()),
+        "xml_chars": len(xml),
+        "xml_tokens": n_tokens,
+        "ratio": round(len(xml)/n_tokens, 2),
+        "leveling": header["title_leveling"],
+        "L1": levels.get(1,0), "L2": levels.get(2,0),
+        "L3": levels.get(3,0), "L4": levels.get(4,0),
+        "img_nocap": len(img_surfaces),
+        "img_nocap_<1%": sum(1 for s in img_surfaces if s < 0.01),
+        "img_nocap_>20%": sum(1 for s in img_surfaces if s > 0.20),
+    })
+
+df = pd.DataFrame(rows).sort_values("xml_tokens", ascending=False).reset_index(drop=True)
+
+# Résumé compact
+tot_chars = df["xml_chars"].sum()
+tot_tokens = df["xml_tokens"].sum()
+print(f"Ratio chars/token global : {tot_chars/tot_tokens:.2f}  (len//4 se trompe de {100*(tot_chars/4-tot_tokens)/tot_tokens:+.0f}%)")
+print(f"Docs avec title_leveling='llm' : {(df['leveling']=='llm').sum()}/{len(df)}")
+print(f"Docs > 30K tokens : {(df['xml_tokens']>30_000).sum()}/{len(df)}")
+print(f"Images sans caption : {df['img_nocap'].sum()} au total, "
+      f"{df['img_nocap_<1%'].sum()} font <1% de page, "
+      f"{df['img_nocap_>20%'].sum()} font >20%")
+
+df
