@@ -1,0 +1,232 @@
+from pathlib import Path
+import json
+import re
+import shutil
+import tarfile
+import zipfile
+from collections import Counter
+
+SRC = Path("data/modelhub/dataset/huggingface.co/zhaosuifeng/FinRAGBench-V/main")
+DST = Path("data/FinRAGBench-V")
+
+# --- preconditions ---
+assert SRC.exists(), f"source not found: {SRC}"
+required = [
+    "queries/queries_en.json",
+    "pdfs_for_QA/pdf_en.tar.gz",
+    "citation_labels/citation_labels.zip",
+]
+missing = [p for p in required if not (SRC / p).exists()]
+assert not missing, f"missing in source: {missing}"
+
+DST.mkdir(parents=True, exist_ok=True)
+(DST / "pdfs").mkdir(exist_ok=True)
+(DST / "citation_labels").mkdir(exist_ok=True)
+
+REPORT = []
+def log(msg=""):
+    print(msg)
+    REPORT.append(msg)
+
+log(f"source : {SRC}")
+log(f"target : {DST}")
+
+
+
+
+# --- copy raw queries_en.json (source of truth, never modified) ---
+raw_src = SRC / "queries/queries_en.json"
+raw_dst = DST / "queries_en.json"
+shutil.copy(raw_src, raw_dst)
+queries = json.loads(raw_dst.read_text(encoding="utf-8"))
+log(f"\n[queries] copied queries_en.json ({len(queries)} records)")
+
+# --- produce queries_en_clean.json ---
+# D1 (dup query-id):    keep both paraphrases → keyed positionally downstream
+# D2 (missing pages):   drop the 1 record with no from_pages
+# D5 (casing variants): normalize 'multipage' → 'MultiPage'
+# D6 (range mismatch):  keep, from_pages is source of truth
+def norm_category(cat):
+    return re.sub(r"multipage", "MultiPage", cat, flags=re.IGNORECASE)
+
+clean = []
+d2_dropped = []
+for rec in queries:
+    if "from_pages" not in rec or not str(rec.get("from_pages", "")).strip():
+        d2_dropped.append(rec["query-id"])
+        continue
+    rec_c = dict(rec)
+    rec_c["category"] = norm_category(rec["category"])
+    clean.append(rec_c)
+
+(DST / "queries_en_clean.json").write_text(
+    json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+log(f"[queries] wrote queries_en_clean.json ({len(clean)} records)")
+log(f"          D2 dropped: {d2_dropped}")
+log(f"          categories after normalization:")
+for cat, n in Counter(r["category"] for r in clean).most_common():
+    log(f"            {n:4d}  {cat}")
+
+# --- derive the set of source docs actually needed ---
+QID_RE = re.compile(r"^(?P<doc>.+?)_(?:multipage_\d+-\d+|\d+)\.png-\d+$")
+docs_needed = set()
+for rec in clean:
+    m = QID_RE.match(rec["query-id"])
+    if m:
+        docs_needed.add(m.group("doc"))
+log(f"[queries] unique source docs referenced by clean queries: {len(docs_needed)}")
+
+
+
+
+
+
+
+tar_path = SRC / "pdfs_for_QA/pdf_en.tar.gz"
+pdfs_dir = DST / "pdfs"
+
+log(f"\n[pdfs] opening {tar_path.name}...")
+with tarfile.open(tar_path) as tf:
+    members = tf.getmembers()
+    pdf_members = [
+        m for m in members
+        if m.isfile() and m.name.lower().endswith(".pdf")
+        and not m.name.startswith("/") and ".." not in Path(m.name).parts
+    ]
+    log(f"       archive: {len(members)} entries, {len(pdf_members)} PDFs")
+
+    # flatten: strip any leading folder in the tar
+    n_extracted = n_skipped = 0
+    for m in pdf_members:
+        target = pdfs_dir / Path(m.name).name
+        if target.exists() and target.stat().st_size == m.size:
+            n_skipped += 1
+            continue
+        with tf.extractfile(m) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        n_extracted += 1
+
+pdfs_on_disk = sorted(p for p in pdfs_dir.iterdir() if p.suffix.lower() == ".pdf")
+log(f"       extracted: {n_extracted} new, {n_skipped} already present")
+log(f"       PDFs on disk: {len(pdfs_on_disk)}")
+
+# --- cross-check: every queried doc has a PDF? ---
+pdf_stems = {p.stem for p in pdfs_on_disk}
+missing_pdfs = sorted(docs_needed - pdf_stems)
+unused_pdfs = sorted(pdf_stems - docs_needed)
+log(f"       queried docs missing a PDF: {len(missing_pdfs)}")
+for d in missing_pdfs[:10]:
+    log(f"           - {d}")
+if len(missing_pdfs) > 10:
+    log(f"           ... and {len(missing_pdfs) - 10} more")
+log(f"       PDFs not referenced by any query: {len(unused_pdfs)}")
+
+
+
+
+
+
+
+
+
+zip_path = SRC / "citation_labels/citation_labels.zip"
+cite_dir = DST / "citation_labels"
+
+def fix_name(name):
+    """zipfile decodes non-UTF-8 filenames as cp437, giving mojibake.
+    Round-trip cp437 → UTF-8 recovers the original when the zip creator
+    wrote UTF-8 bytes without setting the UTF-8 flag."""
+    if not any(ord(c) > 127 for c in name):
+        return name
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
+log(f"\n[citations] extracting {zip_path.name}...")
+n_imgs = n_json = n_fixed = n_skipped = 0
+
+with zipfile.ZipFile(zip_path) as zf:
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        raw = info.filename
+        name = fix_name(raw)
+        if name != raw:
+            n_fixed += 1
+
+        # strip the top-level "citation_labels_new/" prefix from the archive
+        parts = Path(name).parts
+        if parts and parts[0] == "citation_labels_new":
+            parts = parts[1:]
+        if not parts:
+            continue
+        # basic safety
+        if any(p in ("..", "") for p in parts):
+            continue
+
+        target = cite_dir / Path(*parts)
+        if target.exists() and target.stat().st_size == info.file_size:
+            n_skipped += 1
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+        if target.suffix.lower() == ".json":
+            n_json += 1
+        else:
+            n_imgs += 1
+
+log(f"            files new/skipped        : {n_imgs + n_json - n_skipped} / {n_skipped}")
+log(f"            images extracted (total) : {n_imgs}")
+log(f"            json  extracted (total)  : {n_json}")
+log(f"            mojibake names repaired  : {n_fixed}")
+
+# --- filter bboxes JSON to English query-ids only ---
+bbox_json = cite_dir / "selected_200_with_bboxes.json"
+if bbox_json.exists():
+    bboxes = json.loads(bbox_json.read_text(encoding="utf-8"))
+    en_qids = {r["query-id"] for r in clean}
+    bboxes_en = [b for b in bboxes if b["query-id"] in en_qids]
+    (cite_dir / "selected_200_with_bboxes_en.json").write_text(
+        json.dumps(bboxes_en, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log(f"            bboxes total            : {len(bboxes)}")
+    log(f"            bboxes filtered to EN   : {len(bboxes_en)}")
+else:
+    log(f"            WARNING: {bbox_json.name} not found in archive")
+
+
+
+
+
+
+
+# --- final layout check ---
+log("\n[verify] final layout:")
+def tree(root, prefix="", max_items=6):
+    items = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name))
+    shown = items[:max_items]
+    for p in shown:
+        kind = "DIR " if p.is_dir() else "FILE"
+        size = "" if p.is_dir() else f"  ({p.stat().st_size:,} bytes)"
+        n = ""
+        if p.is_dir():
+            children = list(p.iterdir())
+            n = f"  [{len(children)} items]"
+        log(f"  {prefix}{kind} {p.name}{n}{size}")
+    if len(items) > max_items:
+        log(f"  {prefix}     ... and {len(items) - max_items} more")
+
+tree(DST)
+
+# --- write prep_report.md ---
+(DST / "prep_report.md").write_text(
+    "# FinRAGBench-V — data prep report\n\n```\n"
+    + "\n".join(REPORT) + "\n```\n",
+    encoding="utf-8",
+)
+log(f"\n[report] wrote {DST / 'prep_report.md'}")
+log("\ndone.")
