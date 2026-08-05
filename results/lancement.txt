@@ -1,0 +1,157 @@
+from pathlib import Path
+import json
+import time
+import traceback
+import pandas as pd
+
+# adapter cet import à ton module
+from pipeline import process_pipeline
+
+DATA_ROOT = Path("data/FinRAGBench-V")
+PDF_DIR = DATA_ROOT / "pdfs"
+OUT_DIR = DATA_ROOT / "processed"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# resume behavior: skip PDFs already processed
+SKIP_IF_DONE = True
+
+# save_intermediate=False → same behavior as your existing pipeline
+SAVE_INTERMEDIATE = False
+
+pdfs = sorted(PDF_DIR.glob("*.pdf"))
+print(f"PDFs to process: {len(pdfs)}")
+print(f"output root    : {OUT_DIR}")
+
+
+
+
+
+
+
+
+import fitz  # for page count only; drop if you don't want it
+
+STATS_CSV = OUT_DIR / "_stats.csv"
+ERR_LOG = OUT_DIR / "_errors.log"
+
+# resume: load existing stats if any
+if SKIP_IF_DONE and STATS_CSV.exists():
+    df_existing = pd.read_csv(STATS_CSV)
+    done = set(df_existing["stem"].astype(str))
+    rows = df_existing.to_dict("records")
+    print(f"resuming: {len(done)} already done")
+else:
+    done = set()
+    rows = []
+
+t_start = time.time()
+for i, pdf_path in enumerate(pdfs, 1):
+    stem = pdf_path.stem
+    doc_out = OUT_DIR / stem
+    marker = doc_out / "stats.json"
+
+    if SKIP_IF_DONE and stem in done and marker.exists():
+        continue
+
+    print(f"[{i:3d}/{len(pdfs)}] {stem}")
+    doc_out.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # page count for context; not required by pipeline
+        with fitz.open(pdf_path) as d:
+            n_pages = d.page_count
+
+        t_doc = time.time()
+        markdown_str, id_to_bbox, doc_ocr, stats = process_pipeline(
+            pdf_path=pdf_path,
+            output_path=OUT_DIR,          # process_pipeline creates OUT_DIR/{stem}/ as workdir
+            save_intermediate=SAVE_INTERMEDIATE,
+        )
+        total_s = time.time() - t_doc
+
+        # persist artifacts
+        (doc_out / "markdown.md").write_text(markdown_str, encoding="utf-8")
+        (doc_out / "id_to_bbox.json").write_text(
+            json.dumps(id_to_bbox, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (doc_out / "doc_ocr.json").write_text(
+            json.dumps(doc_ocr, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # persist full stats blob + flatten one row for the CSV
+        full_stats = {
+            "stem": stem,
+            "n_pages": n_pages,
+            "total_s": round(total_s, 2),
+            "layout_s": round(stats["layout_s"], 2),
+            "ocr": stats["ocr"],
+        }
+        (doc_out / "stats.json").write_text(
+            json.dumps(full_stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        row = {
+            "stem": stem,
+            "n_pages": n_pages,
+            "total_s": round(total_s, 2),
+            "layout_s": round(stats["layout_s"], 2),
+            "sec_per_page": round(total_s / max(n_pages, 1), 3),
+            "status": "ok",
+            "error": "",
+        }
+        # flatten ocr stats dict into row (top-level scalars only)
+        for k, v in stats["ocr"].items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                row[f"ocr_{k}"] = v
+        rows.append(row)
+
+        # write CSV every 5 docs so a crash doesn't lose progress
+        if i % 5 == 0:
+            pd.DataFrame(rows).to_csv(STATS_CSV, index=False)
+            print(f"    checkpointed {len(rows)} rows")
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"    ERROR: {err}")
+        with open(ERR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{stem}]\n{err}\n{traceback.format_exc()}\n\n")
+        rows.append({"stem": stem, "status": "error", "error": err})
+
+# final write
+pd.DataFrame(rows).to_csv(STATS_CSV, index=False)
+print(f"\ndone in {(time.time() - t_start) / 60:.1f} min")
+print(f"stats -> {STATS_CSV}")
+
+
+
+
+
+
+
+
+
+df = pd.read_csv(STATS_CSV)
+ok = df[df["status"] == "ok"]
+
+print(f"total processed : {len(df)}")
+print(f"  ok            : {len(ok)}")
+print(f"  errors        : {len(df) - len(ok)}")
+print(f"total time (ok) : {ok['total_s'].sum() / 60:.1f} min")
+print(f"total pages     : {int(ok['n_pages'].sum())}")
+
+print("\n=== timing ===")
+print(ok[["n_pages", "total_s", "layout_s", "sec_per_page"]].describe().round(2))
+
+print("\n=== top 10 slowest docs ===")
+print(ok.nlargest(10, "total_s")[["stem", "n_pages", "total_s", "sec_per_page"]].to_string(index=False))
+
+if len(df) - len(ok):
+    print("\n=== errors ===")
+    print(df[df["status"] != "ok"][["stem", "error"]].to_string(index=False))
+
+
+
+
+
+
+
