@@ -1,0 +1,23 @@
+DQ EXPORT — READING GUIDE
+
+Snapshot of the current data quality state, based on the last rule engine run.
+
+SHEETS
+
+Coverage — Coverage matrix: FENGO columns × DQ dimensions. Each cell = number of active rules covering that column on that dimension. total = 0 means uncovered.
+
+Rule Execution — One row per rule. Aggregated view: applicable rows, failure count, pass rate.
+
+Violations — One row per failing record. Same information as Rule Execution but at record level (a rule with 15 failures produces 15 rows here).
+
+Agent Proposals — Full history of LLM agent proposals, all statuses. Kinds: add_rule, modify_rule, delete_rule, definition.
+
+VOCABULARY
+
+Failure, violation, and disquality all refer to the same thing: a record that did not pass a rule.
+
+NOTES
+
+Snapshot from the last run; re-export after a new run to refresh.
+No DQI aggregate — see individual pass rates in Rule Execution.
+Approved proposals are logged but not yet auto-applied.
