@@ -1,0 +1,57 @@
+"""Multi-sheet Excel export of the current data quality state."""
+import json
+from pathlib import Path
+
+import pandas as pd
+
+from dq import proposals
+from dq.bootstrap import load_config
+
+PROPOSAL_COLUMNS = ["id", "kind", "status", "created_at", "rationale", "payload_json"]
+
+
+def _artifacts_dir():
+    """Return the artifacts directory as configured."""
+    return Path(load_config()["paths"]["artifacts"])
+
+
+def _proposals_frame():
+    """Return all proposals as a flat frame, payload kept as raw JSON text."""
+    rows = [{
+        "id": p["id"],
+        "kind": p["kind"],
+        "status": p["status"],
+        "created_at": p["created_at"],
+        "rationale": p["rationale"],
+        "payload_json": json.dumps(p.get("payload", {}), ensure_ascii=False, default=str),
+    } for p in proposals.load_proposals()]
+    return pd.DataFrame(rows, columns=PROPOSAL_COLUMNS)
+
+
+def export_to_excel(output_path):
+    """Dump coverage, rule execution, violations and agent proposals into one workbook."""
+    art = _artifacts_dir()
+    coverage = pd.read_csv(art / "coverage.csv", index_col=0)
+    rules = pd.read_csv(art / "run_rules.csv")
+    violations = pd.read_csv(art / "run_records.csv")
+    props = _proposals_frame()
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as xl:
+        coverage.to_excel(xl, sheet_name="Coverage")
+        rules.to_excel(xl, sheet_name="Rule Execution", index=False)
+        violations.to_excel(xl, sheet_name="Violations", index=False)
+        props.to_excel(xl, sheet_name="Agent Proposals", index=False)
+
+    return output_path
+
+
+
+cd data-quality-rules
+python -c "
+from dq.export import export_to_excel
+from dq.bootstrap import PROJECT_ROOT
+from pathlib import Path
+out = Path(PROJECT_ROOT) / 'artifacts' / 'dq_export.xlsx'
+export_to_excel(out)
+print(f'Written to {out}')
+"
