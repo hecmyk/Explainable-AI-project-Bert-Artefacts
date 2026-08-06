@@ -1,0 +1,105 @@
+def load_or_build_dom(doc_dir: Path) -> tuple[dict, str]:
+    """DOM and XML skeleton of a document, built from doc_ocr.json on first use.
+
+    Both are persisted next to doc_ocr.json (doc_dom.json, skeleton.xml) and reused as-is
+    afterwards. Building is NOT free or reproducible: build_dom's default title_leveler
+    calls an LLM, so a rebuilt DOM can nest its sections differently and shift every
+    section_id. Freezing them is what keeps a resumed run comparable to the one before.
+
+    Args:
+        doc_dir: The processed/{stem} directory.
+
+    Returns:
+        `(dom, xml_skeleton)`.
+    """
+    dom_path = doc_dir / "doc_dom.json"
+    xml_path = doc_dir / "skeleton.xml"
+
+    if dom_path.exists():
+        dom = json.loads(dom_path.read_text(encoding="utf-8"))
+    else:
+        stem = doc_dir.name
+        doc_ocr = json.loads((doc_dir / "doc_ocr.json").read_text(encoding="utf-8"))
+        dom = build_dom(doc_ocr, page_dims_from_pdf(PDFS / f"{stem}.pdf"),
+                        doc_id=stem, pdf_name=f"{stem}.pdf")
+        dom_path.write_text(json.dumps(dom, ensure_ascii=False), encoding="utf-8")
+
+    # Checked separately from the DOM: the two writes are not atomic, so a crash between
+    # them leaves a DOM with no skeleton — rebuilt here instead of raising.
+    if xml_path.exists():
+        skeleton = xml_path.read_text(encoding="utf-8")
+    else:
+        skeleton = build_outline_xml(dom)
+        xml_path.write_text(skeleton, encoding="utf-8")
+
+    return dom, skeleton
+
+
+def run_one(dom: dict, skeleton: str, query: dict) -> dict:
+    """Answer one query and build its result row; an agent failure becomes `error`."""
+    started = time.perf_counter()
+    try:
+        draft, metrics = run_dom_agent(dom, skeleton, FIELD_DEFINITIONS,
+                                       max_steps=MAX_STEPS, mode="qa", question=query["query"])
+        answer, error = draft["qa"], None
+    except Exception as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+    metrics["wall_clock_s"] = round(time.perf_counter() - started, 2)
+
+    return {
+        "query_id": query["query-id"],
+        "question": query["query"],
+        "gold_answer": query["answer"],
+        "gold_pages": [int(p) for p in str(query["from_pages"]).split(",")],
+        "answer_type": query["answer_type"],
+        "category": query["category"],
+        "pred_answer": answer.get("answer"),
+        "pred_quote": answer.get("quote"),
+        "pred_source_page": answer.get("source_page"),
+        "agent_metrics": metrics,
+        "error": error,
+    }
+
+
+def run_benchmark(limit: int | None = None) -> None:
+    """Run every pending query, one JSONL file per document.
+
+    Args:
+        limit: Stop after N queries in total (pilot runs); None runs them all.
+    """
+    queries = json.loads(QUERIES.read_text(encoding="utf-8"))
+    done_total = 0
+
+    # doc_ocr.json is the real prerequisite: the DOM is derived from it on first use.
+    for ocr_path in sorted(PROCESSED.glob("*/doc_ocr.json")):
+        doc_dir = ocr_path.parent
+        results = doc_dir / "qa_results.jsonl"
+
+        done = set()
+        if results.exists():
+            done = {json.loads(line)["query_id"]
+                    for line in results.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+        pending = [q for q in queries
+                   if q["query-id"].startswith(doc_dir.name + "_") and q["query-id"] not in done]
+        if limit is not None:
+            pending = pending[:limit - done_total]
+        if not pending:
+            continue
+
+        # Loaded or built once per document, not once per query.
+        dom, skeleton = load_or_build_dom(doc_dir)
+
+        print(f"[{doc_dir.name}] {len(pending)} queries, {len(done)} déjà faites")
+
+        # Appended and flushed per query: a crash keeps every answer already paid for.
+        with results.open("a", encoding="utf-8") as out:
+            bar = tqdm(pending, desc=doc_dir.name, unit="q")
+            for query in bar:
+                bar.set_postfix_str(query["query-id"])
+                out.write(json.dumps(run_one(dom, skeleton, query), ensure_ascii=False) + "\n")
+                out.flush()
+
+        done_total += len(pending)
+        if limit is not None and done_total >= limit:
+            break
