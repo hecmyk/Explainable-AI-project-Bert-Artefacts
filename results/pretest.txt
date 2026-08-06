@@ -1,0 +1,53 @@
+from pathlib import Path
+import shutil
+
+ROOT = Path("data/FinRAGBench-V")
+PDFS = ROOT / "pdfs"
+PROCESSED = ROOT / "processed"
+
+REQUIRED = ["markdown.md", "doc_ocr.json", "stats.json"]  # marqueurs de "traité"
+
+kept, removed = 0, 0
+for d in PROCESSED.iterdir():
+    if not d.is_dir():
+        continue
+    if all((d / f).exists() for f in REQUIRED):
+        pdf = PDFS / f"{d.name}.pdf"
+        if pdf.exists():
+            shutil.copy2(pdf, d / pdf.name)  # ou shutil.move si tu veux déplacer
+        kept += 1
+    else:
+        shutil.rmtree(d)
+        removed += 1
+
+print(f"kept: {kept}, removed: {removed}")
+
+
+
+
+
+
+
+
+from pathlib import Path
+import json
+from dom_build import build_dom
+from dom_render import render_dom  # adapte le nom si différent
+from dom_tools import render_section
+from pdf_utils import page_dims_from_pdf
+
+STEM = "XXXXX"  # ← mets le stem ici
+SECTION_ID = "s3"  # ← mets la section à tester ici
+
+d = Path("data/FinRAGBench-V/processed") / STEM
+doc_ocr = json.loads((d / "doc_ocr.json").read_text())
+page_dims = page_dims_from_pdf(d / f"{STEM}.pdf")
+
+dom = build_dom(doc_ocr, page_dims)  # title_leveler=None si tu veux skip le LLM
+(d / "doc_dom.json").write_text(json.dumps(dom, ensure_ascii=False, indent=2))
+
+print("=" * 60, "SKELETON", "=" * 60)
+print(render_dom(dom))
+
+print("=" * 60, f"SECTION {SECTION_ID}", "=" * 60)
+print(render_section(SECTION_ID, dom))
