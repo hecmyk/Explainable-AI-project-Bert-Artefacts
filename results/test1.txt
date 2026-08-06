@@ -1,0 +1,144 @@
+def render_section(section_id: str, dom: dict) -> str | dict:
+    """Render a section and its whole subtree as markdown, with page markers.
+
+    The atoms are wrapped in page bands (N 0-indexed, like the skeleton) so the agent can
+    report the page a quote sits on by copying the marker above it instead of computing
+    it. The opening and closing markers say whether the section is flush with the page or
+    starts/ends inside it:
+
+        ### Start Page N ###                  the section's first atom opens page N
+        ### Section starts within Page N ###  page N already had content above it
+        ### End Page N ###                    the section's last atom closes page N
+        ### Section ends within Page N ###    page N still has content below it
+
+    A page change inside the section emits the bare "End Page N" / "Start Page N+1" pair.
+
+    Args:
+        section_id: Section id as advertised in the skeleton (e.g. "s3", "s_toc").
+        dom: build_dom output ({header, index, chrome, tree}).
+
+    Returns:
+        The markdown string, or an error dict {"error", "id_requested", "nearby_valid"}
+        when the id is not in the section tree.
+    """
+    tree, index = dom["tree"], dom["index"]
+
+    subtree = _collect_descendant_sections(section_id, tree)
+    if subtree is None:
+        logger.warning("%s: unknown id %r", GET_SECTION, section_id)
+        return {
+            "error": "unknown_section_id",
+            "id_requested": section_id,
+            "nearby_valid": _nearby_ids(section_id, list(all_section_ids(tree))),
+        }
+
+    wanted = {s["section_id"] for s, _ in subtree}
+    # The opening title atom carries its section_id but lives outside "children"
+    # (dom_build references it via title_id), so the flat scan would render it twice.
+    titles = {s["title_id"] for s, _ in subtree if s["title_id"]}
+
+    # dom["index"] is in insertion = global reading order, and chrome never enters it,
+    # so filtering preserves reading order without any re-sort. dim7 is a PER-PAGE key:
+    # sorting on it would scramble a multi-page section.
+    by_section: dict[str, list[dict]] = {}
+    for atom_id, atom in index.items():
+        if atom["section_id"] in wanted and atom_id not in titles:
+            by_section.setdefault(atom["section_id"], []).append(atom)
+
+    # Page extremities, over the WHOLE document: "flush with the page" is a property of
+    # the page, not of the requested subtree. Counted on the atoms that actually render —
+    # a section title comes out as a markdown heading, outside the bands, and an atom
+    # rendering "" emits nothing, so neither can hold a page end. Including them would
+    # make every section opening at a page top report "starts within".
+    all_titles = {s["title_id"] for s, _ in _iter_sections(tree["sections"]) if s["title_id"]}
+    page_first: dict[int, str] = {}
+    page_last: dict[int, str] = {}
+    for atom_id, atom in index.items():
+        if atom_id not in all_titles and _atom_markdown(atom):
+            page_first.setdefault(atom["page"], atom_id)
+            page_last[atom["page"]] = atom_id
+
+    blocks: list[str] = []
+    for section, depth in subtree:
+        # The heading stays OUTSIDE the page bands: it is never the evidence a quote is
+        # taken from, and keeping it out spares an empty band on a section with no atom.
+        blocks.append(f"{'#' * (depth + 1)} {_heading_text(section)}")
+
+        # Materialized before anything is emitted: both boundary markers depend on whether
+        # the section's first/last RENDERED atom is also the page's, so the end of the
+        # section must be known before its opening marker is written.
+        rendered = []
+        for atom in by_section.get(section["section_id"], ()):
+            block = _atom_markdown(atom)
+            if block:
+                rendered.append((atom, block))
+        if not rendered:
+            continue
+
+        first, last = rendered[0][0], rendered[-1][0]
+        page = first["page"]
+        blocks.append(f"### Start Page {page} ###" if page_first.get(page) == first["id"]
+                      else f"### Section starts within Page {page} ###")
+        for atom, block in rendered:
+            # Internal page change: bare pair, the section owns both sides of the break.
+            if atom["page"] != page:
+                blocks.append(f"### End Page {page} ###")
+                page = atom["page"]
+                blocks.append(f"### Start Page {page} ###")
+            blocks.append(block)
+        blocks.append(f"### End Page {page} ###" if page_last.get(page) == last["id"]
+                      else f"### Section ends within Page {page} ###")
+    return "\n\n".join(blocks)
+
+
+
+
+
+
+
+
+from pathlib import Path
+import json
+from agent_dom import run_dom_agent
+
+STEM = "XXXXX"     # ← stem à tester
+QUERY_IDX = 0      # ← index de la query (parmi celles du doc)
+
+ROOT = Path("data/FinRAGBench-V")
+queries = json.loads((ROOT / "queries_en_clean.json").read_text())
+doc_queries = [q for q in queries if q["doc_stem"] == STEM]
+print(f"{len(doc_queries)} queries pour {STEM}")
+
+q = doc_queries[QUERY_IDX]
+print(f"Q: {q['question']}")
+print(f"GT answer: {q['answer']}")
+print(f"GT pages: {q['from_pages']}")
+print(f"answer_type: {q['answer_type']}")
+
+d = ROOT / "processed" / STEM
+dom = json.loads((d / "doc_dom.json").read_text())
+
+field_definitions = {
+    "qa": {
+        "description": "Answer the question grounded in the document.",
+        "schema": {
+            "answer": {"type": ["string", "null"]},
+            "quote": {"type": ["string", "null"]},
+            "source_page": {"type": ["integer", "null"]},
+        },
+    }
+}
+
+result = run_dom_agent(
+    dom=dom,
+    field_definitions=field_definitions,
+    task=q["question"],
+    mode="qa",
+    answer_type=q["answer_type"],
+    max_steps=10,
+)
+
+print("=" * 60, "DRAFT", "=" * 60)
+print(json.dumps(result["draft"], indent=2, ensure_ascii=False))
+print("=" * 60, "METRICS", "=" * 60)
+print(json.dumps(result["metrics"], indent=2))
