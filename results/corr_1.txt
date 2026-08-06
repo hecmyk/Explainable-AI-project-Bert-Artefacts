@@ -1,0 +1,145 @@
+from pathlib import Path
+import json
+
+ROOT = Path("/home/datacamp/data/FinRAGBench-V")
+rows = []
+for f in ROOT.glob("processed/*/qa_results.jsonl"):
+    for line in f.read_text().splitlines():
+        rows.append(json.loads(line))
+
+print(f"Total: {len(rows)}")
+print(f"Errors: {sum(1 for r in rows if r.get('error'))}")
+print(f"Abstentions: {sum(1 for r in rows if r['pred_answer'] is None)}")
+print(f"Wall clock moyen: {sum(r['agent_metrics']['wall_clock_s'] for r in rows) / len(rows):.1f}s")
+print(f"n_steps moyen: {sum(r['agent_metrics']['n_steps'] for r in rows) / len(rows):.1f}")
+print(f"Hit max_iter: {sum(1 for r in rows if r['agent_metrics'].get('hit_max_iterations'))}")
+
+# check page hit à la main
+for r in rows[:10]:
+    hit = (r['pred_source_page'] + 1) in r['gold_pages'] if r['pred_source_page'] is not None else None
+    print(f"[{'✓' if hit else '✗' if hit is False else '-'}] pred_p={r['pred_source_page']} gold={r['gold_pages']}")
+    print(f"    Q: {r['question'][:70]}")
+    print(f"    GT: {r['gold_answer'][:70]}")
+    print(f"    PR: {(r['pred_answer'] or '')[:70]}")
+
+
+
+
+
+
+
+
+
+
+
+
+"""Phase 1 QA benchmark runner.
+
+Runs run_dom_agent(mode="qa") over every query whose document has a frozen doc_dom.json,
+and appends one JSON line per query to processed/{stem}/qa_results.jsonl. Resumable: a
+query already present in that file is skipped, so calling run_benchmark() again picks up
+where the previous call stopped.
+
+A query belongs to the document whose folder name prefixes its query-id — no assumption
+on the id format beyond that separator.
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the imports below
+
+from agent_dom import run_dom_agent          # noqa: E402
+from dom_render import build_outline_xml     # noqa: E402
+
+ROOT = Path("/home/datacamp/data/FinRAGBench-V")
+PROCESSED = ROOT / "processed"
+QUERIES = ROOT / "queries_en_clean.json"
+
+FIELD_DEFINITIONS = {"qa": "Answer the question grounded in the document."}
+MAX_STEPS = 10
+
+
+def run_one(dom: dict, skeleton: str, query: dict) -> dict:
+    """Answer one query and build its result row; an agent failure becomes `error`."""
+    started = time.perf_counter()
+    try:
+        draft, metrics = run_dom_agent(dom, skeleton, FIELD_DEFINITIONS,
+                                       max_steps=MAX_STEPS, mode="qa", question=query["query"])
+        answer, error = draft["qa"], None
+    except Exception as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+    metrics["wall_clock_s"] = round(time.perf_counter() - started, 2)
+
+    return {
+        "query_id": query["query-id"],
+        "question": query["query"],
+        "gold_answer": query["answer"],
+        "gold_pages": [int(p) for p in str(query["from_pages"]).split(",")],
+        "answer_type": query["answer_type"],
+        "category": query["category"],
+        "pred_answer": answer.get("answer"),
+        "pred_quote": answer.get("quote"),
+        "pred_source_page": answer.get("source_page"),
+        "agent_metrics": metrics,
+        "error": error,
+    }
+
+
+def run_benchmark(limit: int | None = None) -> None:
+    """Run every pending query, one JSONL file per document.
+
+    Args:
+        limit: Stop after N queries in total (pilot runs); None runs them all.
+    """
+    queries = json.loads(QUERIES.read_text(encoding="utf-8"))
+    done_total = 0
+
+    for dom_path in sorted(PROCESSED.glob("*/doc_dom.json")):
+        doc_dir = dom_path.parent
+        results = doc_dir / "qa_results.jsonl"
+
+        done = set()
+        if results.exists():
+            done = {json.loads(line)["query_id"]
+                    for line in results.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+        pending = [q for q in queries
+                   if q["query-id"].startswith(doc_dir.name + "_") and q["query-id"] not in done]
+        if limit is not None:
+            pending = pending[:limit - done_total]
+        if not pending:
+            continue
+
+        # Both built once per document, not once per query.
+        dom = json.loads(dom_path.read_text(encoding="utf-8"))
+        skeleton = build_outline_xml(dom)
+
+        print(f"[{doc_dir.name}] {len(pending)} queries, {len(done)} déjà faites")
+
+        # Appended and flushed per query: a crash keeps every answer already paid for.
+        with results.open("a", encoding="utf-8") as out:
+            bar = tqdm(pending, desc=doc_dir.name, unit="q")
+            for query in bar:
+                bar.set_postfix_str(query["query-id"])
+                out.write(json.dumps(run_one(dom, skeleton, query), ensure_ascii=False) + "\n")
+                out.flush()
+
+        done_total += len(pending)
+        if limit is not None and done_total >= limit:
+            break
+
+
+
+
+
+
+from pathlib import Path
+PROCESSED = Path("/home/datacamp/data/FinRAGBench-V/processed")
+for p in sorted(PROCESSED.iterdir()):
+    print(repr(p.name), "| dir:", p.is_dir(), "| doc_dom:", (p / "doc_dom.json").exists())
+
