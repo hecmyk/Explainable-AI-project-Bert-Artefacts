@@ -1,0 +1,128 @@
+"""Phase 1 QA benchmark runner.
+
+Runs run_dom_agent(mode="qa") over every query whose document has a frozen doc_dom.json,
+and appends one JSON line per query to processed/{stem}/qa_results.jsonl. Resumable: a
+query already present in that file is skipped, so an interrupted run is restarted by
+calling run_benchmark() again.
+
+The DOM and its XML skeleton are built once per document, not once per query.
+"""
+
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the imports below
+
+from agent_dom import run_dom_agent          # noqa: E402
+from dom_render import build_outline_xml     # noqa: E402
+
+ROOT = Path("/home/datacamp/data/FinRAGBench-V")
+QUERIES = ROOT / "queries_en_clean.json"
+PROCESSED = ROOT / "processed"
+
+FIELD_DEFINITIONS = {"qa": "Answer the question grounded in the document."}
+MAX_STEPS = 10
+
+# query-id is "{stem}_{page}.png-{idx}" or "{stem}_multipage_{a}-{b}.png-{idx}". The stem
+# itself contains underscores (LSE_HWDN_2023), so splitting on "_" would truncate it; the
+# greedy .+ backtracks to the only split the anchored suffix allows.
+_QID = re.compile(r"^(?P<stem>.+)_(?:multipage_\d+-\d+|\d+)\.png-\d+$")
+
+
+def stem_of(query_id: str) -> str:
+    """Document stem carried by a query-id."""
+    return _QID.match(query_id).group("stem")
+
+
+def gold_pages(from_pages: str | list) -> list[int]:
+    """from_pages as a page list; the raw dataset stores it as "16" or "157,158,159"."""
+    return from_pages if isinstance(from_pages, list) else [int(p) for p in str(from_pages).split(",")]
+
+
+def done_ids(results_path: Path) -> set[str]:
+    """query_ids already written to a qa_results.jsonl (empty set when it does not exist)."""
+    if not results_path.exists():
+        return set()
+    return {json.loads(line)["query_id"]
+            for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def run_one(dom: dict, skeleton: str, query: dict) -> dict:
+    """Answer one query and build its result row; an agent failure becomes `error`."""
+    started = time.perf_counter()
+    try:
+        draft, metrics = run_dom_agent(dom, skeleton, FIELD_DEFINITIONS,
+                                       max_steps=MAX_STEPS, mode="qa", question=query["query"])
+        answer, error = draft["qa"], None
+    except Exception as e:
+        answer, metrics, error = {}, {}, f"{type(e).__name__}: {e}"
+    metrics["wall_clock_s"] = round(time.perf_counter() - started, 2)
+
+    return {
+        "query_id": query["query-id"],
+        "question": query["query"],
+        "gold_answer": query["answer"],
+        "gold_pages": gold_pages(query["from_pages"]),
+        "answer_type": query["answer_type"],
+        "category": query["category"],
+        "pred_answer": answer.get("answer"),
+        "pred_quote": answer.get("quote"),
+        "pred_source_page": answer.get("source_page"),
+        "agent_metrics": metrics,
+        "error": error,
+    }
+
+
+def build_plan(limit: int | None) -> list[tuple[str, list[dict]]]:
+    """[(stem, pending queries)] for every processed document, resume and limit applied."""
+    by_stem: dict[str, list[dict]] = {}
+    for query in json.loads(QUERIES.read_text(encoding="utf-8")):
+        by_stem.setdefault(stem_of(query["query-id"]), []).append(query)
+
+    plan = []
+    for dom_path in sorted(PROCESSED.glob("*/doc_dom.json")):
+        stem = dom_path.parent.name
+        already = done_ids(dom_path.parent / "qa_results.jsonl")
+        pending = [q for q in by_stem.get(stem, []) if q["query-id"] not in already]
+        if pending:
+            plan.append((stem, pending))
+
+    if limit is None:
+        return plan
+    # Capped on the TOTAL number of queries, documents taken whole until the budget runs out.
+    capped, taken = [], 0
+    for stem, queries in plan:
+        if taken >= limit:
+            break
+        capped.append((stem, queries[:limit - taken]))
+        taken += len(capped[-1][1])
+    return capped
+
+
+def run_benchmark(limit: int | None = None) -> None:
+    """Run every pending query and append the results next to each document.
+
+    Args:
+        limit: Stop after N queries in total (pilot runs); None runs them all.
+    """
+    plan = build_plan(limit)
+    total = sum(len(queries) for _, queries in plan)
+    print(f"{total} queries to run over {len(plan)} documents")
+
+    with tqdm(total=total, unit="q") as bar:
+        for stem, queries in plan:
+            doc_dir = PROCESSED / stem
+            dom = json.loads((doc_dir / "doc_dom.json").read_text(encoding="utf-8"))
+            skeleton = build_outline_xml(dom)
+            bar.set_postfix_str(stem)
+            # Appended and flushed per query: a crash keeps every answer already paid for.
+            with (doc_dir / "qa_results.jsonl").open("a", encoding="utf-8") as out:
+                for query in queries:
+                    out.write(json.dumps(run_one(dom, skeleton, query), ensure_ascii=False) + "\n")
+                    out.flush()
+                    bar.update(1)
