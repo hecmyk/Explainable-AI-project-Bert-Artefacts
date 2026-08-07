@@ -1,0 +1,177 @@
+Slide 1 — Titre & objectif
+
+Titre : DOM-based DocAgent — validation sur FinRAGBench-V
+
+Où on en est : DOM + agent QA validés sur un bench externe
+Pourquoi FinRAGBench-V : dataset RAG multimodal financier publié (EMNLP 2025), documents proches du KYC BNP
+Ce qu'on va voir : construction du DOM → squelette XML → agent → résultats → suite
+
+Visuel : aucun. Slide de cadrage.
+
+Slide 2 — Position dans le pipeline
+
+Titre : Rappel — où intervient le DOM
+
+Pipeline complet : PDF → Layout (PP-DocLayoutV2) → OCR (Mistral) → DOM → Squelette → Agent
+Layout + OCR déjà validés phase précédente (Phase A + B)
+La présentation d'aujourd'hui = les 3 dernières boîtes
+
+Visuel : schéma horizontal 5 boîtes, encadré rouge autour des 3 dernières. Je peux te le générer via Visualizer si tu veux — dis-moi.
+
+Slide 3 — Le DOM en une image
+
+Titre : Le DOM — 4 blocs, un arbre
+
+4 clés top-level : header (métadonnées + stats) · index (dict atom_id → atom, en ordre de lecture) · chrome (headers/footers écartés) · tree (arbre de sections)
+25 labels PP-DocLayoutV2 routés en 3 ensembles disjoints : 14 content · 4 visual · 8 chrome
+Section = 9 champs : section_id, title, title_id, level, level_source, page_start, page_end, children (atom_ids), subsections
+Territoire propagé post-order : une section L1 peut s'étendre sur des dizaines de pages
+Title-leveling : 1 appel Mistral par doc, niveaux 1–4 clampés, level_source = skipped / llm / failed pour rendre visible l'échec
+
+Visuel : screenshot d'une page PDF financière à gauche + extrait JSON du DOM à droite (header condensé + 1 section avec 2 subsections + 1 atom). Format 60 lignes max, syntax-highlighté.
+
+Slide 4 — Le squelette XML
+
+Titre : Squelette XML — la vue compressée donnée à l'agent
+
+Injecté une seule fois dans le premier message user, jamais réinjecté
+Racine <document_skeleton> avec doc_id, pages, n_sections, toc_present
+Chaque <section> porte : id, level, pages, title, puis n_content / n_tables / n_figures — compteur omis si zéro (règle documentée dans le prompt : absence = zéro)
+<preview> : ~120 chars du 1er atom content non-caption, cap à 50 atoms parcourus (borne pour les s_toc géants)
+Placeholders <table> et <figure> avec caption inline (troncature 80 chars, (none) si absente)
+Filtre image : une image sans caption est écartée (logo/bandeau probable) — un chart sans caption est gardé (détection légende ratée probable). Pas de règle de surface.
+
+Visuel : squelette XML complet d'un petit doc à gauche (30 lignes max, syntax-highlighté), à droite les 3 règles clés en encadrés. Auto-fermetures visibles.
+
+Slide 5 — L'agent QA : boucle et outils
+
+Titre : Agent QA — 2 tools, 1 finish-tool
+
+Boucle simple : for step in range(max_steps) — pas de LangGraph, OpenAI SDK direct
+Tool get_section(section_id) — reconstruit le sous-arbre en markdown, filtre index par section_id descendants, aucun re-tri (l'ordre d'insertion de l'index = ordre de lecture)
+Tool submit_draft(fields) — finish-tool à schéma paramétrable : QA vs KYC changent uniquement le schéma
+Anti-doublon : get_section déjà appelé renvoie « Already provided at step N »
+id inconnu → erreur structurée avec nearby_valid (5 plus proches, tri numérique et non alphabétique)
+
+Schémas finish-tool côte à côte :
+
+KYC (multi-champs)	QA
+value	answer
+source_section_id	quote
+	source_page
+
+Tous nullables côté QA → abstention explicite autorisée.
+
+Visuel : le tableau des 2 schémas, et à côté un diagramme minimal [Skeleton XML] → [Loop: get_section × N] → [submit_draft].
+
+Slide 6 — Marqueurs de page : le mécanisme de citation
+
+Titre : Comment l'agent cite une page exacte
+
+Le problème : le squelette donne des intervalles pages="5-12" ; l'agent doit citer LA page précise
+Solution : marqueurs textuels injectés dans le retour de get_section
+4 formes de marqueurs :
+### Start Page N ### — la section commence pile au début de la page
+### Section starts within Page N ### — la section démarre au milieu de la page
+### End Page N ### / ### Section ends within Page N ### — symétriques en fermeture
+Changement de page interne : ### End Page P ### / ### Start Page N ###
+Règle prompt : source_page = le N du ### Start Page N ### le plus proche au-dessus de la quote. Interdit de le dériver de l'attribut pages du squelette.
+N est 0-indexé côté agent, converti en 1-indexé une seule fois dans page_recall
+
+Visuel : extrait get_section avec marqueurs surlignés en couleur — une section qui traverse 2 pages, ~20 lignes.
+
+Slide 7 — Instrumentation : mesurer la conformité au protocole
+
+Titre : 5 catégories tool-call + force submit
+
+Ce que l'agent peut faire à chaque tour :
+
+tool_calls_ok — protocole respecté (cas nominal)
+both_channels — tool call + prose suspecte simultanée (loggé, tool call traité)
+tool_call_in_content — payload en prose sans tool call (pas de salvage : on mesure le brut)
+tool_call_malformed — JSON invalide ou tool inconnu
+no_tool_no_answer — ni l'un ni l'autre → break
+
+Force submit_draft (fin de boucle si pas de draft) :
+
+Appel supplémentaire, tools réduits au finish-tool, tool_choice nommé
+submit_draft_source : tool (spontané) · forced (rattrapé) · none (draft vide toutes clés null pour ne pas perdre la mesure)
+hit_max_iterations : uniquement si la boucle a consommé ses max_steps sans break
+
+Visuel : les 5 catégories en tableau compact, puis la table de vérité submit_draft_source.
+
+Slide 8 — Setup benchmark FinRAGBench-V
+
+Titre : Adaptation intra-doc oracle
+
+Bench original : retrieval cross-doc sur 51K pages
+Notre setup : PDF source fourni, on évalue answer + page
+Justification : phase de validation avant le vrai use case BNP KYC
+Dataset après nettoyage : 538 records → 420 queries traitées sur 105 PDFs, 8 catégories
+~50 % des queries sur des docs de 100–300 pages
+Choix explicite : answer_type (short/long) retiré de ce que voit l'agent → mesure honnête, mais pénalise mécaniquement tout exact-match sur les réponses courtes
+
+Visuel : petit tableau récap gauche (538 → 420, 105 PDFs, 8 cat) + histogramme rapide de la distribution #queries × tranche de pages à droite.
+
+Slide 9 — Métriques
+
+Titre : Ce qu'on mesure — et ce qu'on a choisi de ne pas mesurer
+
+token_f1 : F1 tokens après normalize_text (NFKC, casefold, retrait séparateurs, ponctuation périphérique, articles…)
+Règle de la virgule : séparateur uniquement si précédée d'un chiffre et suivie d'exactement 3 chiffres → préserve la virgule décimale européenne (2,5 reste 2,5)
+page_recall : 1.0 si pred_page + 1 ∈ gold_pages, 0.0 sinon
+Une seule frontière 0/1-index de tout le harness vit ici
+Abstention = 0.0, pas exclue — en intra-doc oracle, ne pas trouver est un échec de localisation
+LLM-as-judge binaire (aligné FinRAGBench-V Table 9) : mistral-medium-3.5-ITG, cache JSON par query_id, ThreadPoolExecutor 8 workers — pas encore lancé sur ce run
+Retiré aujourd'hui : quote_verbatim_ok (rejouable plus tard car pred_quote stocké)
+
+Visuel : encadré central avec la règle de la virgule illustrée par 3 exemples (1,234 → 1234 ; 1,234,567 → 1234567 ; 2,5 → 2,5).
+
+Slide 10 — Résultats
+
+Titre : 420 queries — le tableau de bord
+
+Chiffres principaux (en gros) :
+
+Page-Recall global : 0.536
+Hors IDs invalides : 0.552 · Sur IDs invalides : 0.125
+
+Protocole tool-call (sur ~1785 tours) :
+
+1781 OK · 3 no-tool-no-answer · 1 malformed → très propre
+
+Comportements agrégés :
+
+Errors : 4 (0.9 %)
+Abstentions : 94 (22 %) = 50 volontaires + 40 épuisement + 4 errors
+hit_max_iterations : 48 (11 %)
+IDs invalides : 1.7 % des tool calls, 3.8 % des queries touchées
+submit_draft_source : tool = 365 · forced = 11 · none = 40
+
+Lecture : l'agent respecte le protocole ; les IDs invalides sont rares mais très coûteux quand ils arrivent (0.125 vs 0.552).
+
+Visuel : 3 colonnes chiffrées + une phrase de lecture en bas. Pas de graphe ici, les chiffres se suffisent.
+
+Slide 11 — Limites, choix, et suite
+
+Titre : Ce qui reste à faire
+
+Limites identifiées :
+
+Running heads répétés → sections fantômes (limitation documentée dans dom_build, différée)
+PP-DocLayoutV2 sur pages A3 paysage (fix V3 disponible)
+Reading order dim7 imparfait sur multi-colonnes pathologiques
+LLM-judge non encore lancé → aujourd'hui on n'a que token_f1 + page_recall
+
+Choix assumés :
+
+Abstention notée 0.0 (pas d'exclusion → pas de récompense sur les questions dures)
+Pas de consigne de format court/long → l'agent est mesuré nu
+
+Prochaines étapes :
+
+Lancer LLM-judge (aligné papier Table 9)
+Fix running heads à la racine (plutôt que patch dégradation-cascade)
+Phase 2 : benchmark BNP KYC — le vrai use case
+
+Visuel : 3 colonnes (limites / choix / suite) en parallèle.
