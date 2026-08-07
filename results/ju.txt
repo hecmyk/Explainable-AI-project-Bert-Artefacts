@@ -1,0 +1,293 @@
+"""Concatenate every processed/{stem}/qa_results.jsonl into eval/results_all.jsonl."""
+
+from pathlib import Path
+
+ROOT = Path("/home/datacamp/data/FinRAGBench-V")
+OUT = Path(__file__).resolve().parent / "results_all.jsonl"
+
+n = 0
+with OUT.open("w", encoding="utf-8") as out:
+    for path in sorted((ROOT / "processed").glob("*/qa_results.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                out.write(line + "\n")
+                n += 1
+
+print(f"{n} lignes -> {OUT}")
+
+
+
+
+
+
+
+
+
+
+
+"""LLM-as-judge, binary, aligned with FinRAGBench-V Table 9.
+
+One call per query, cached on query_id so a re-scored run costs nothing. The cache is a
+plain dict shared across the scoring threads: dict get/set is atomic under the GIL, and a
+duplicate judgement of the same query would be harmless anyway.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+from openai import OpenAI
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for config
+
+from config import MISTRAL_API_KEY, MISTRAL_BASE_URL   # noqa: E402
+
+MODEL = "mistral-medium-3.5-ITG"
+CACHE_PATH = Path(__file__).resolve().parent / "judge_cache.json"
+
+client = OpenAI(base_url=MISTRAL_BASE_URL, api_key=MISTRAL_API_KEY)
+
+JUDGE_SYSTEM = (
+    "You are an evaluator. Given a question, a ground truth answer, and a model's answer, "
+    "decide if the model's answer is semantically correct. Reply with only '0' or '1'."
+)
+
+_BINARY = re.compile(r"[01]")
+
+
+def load_cache(path: Path = CACHE_PATH) -> dict:
+    """Judgements cached so far, keyed by query_id; empty dict when the file is absent."""
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def save_cache(cache: dict, path: Path = CACHE_PATH) -> None:
+    """Persist the judgement cache."""
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def judge_answer(question: str, gold: str, pred: str | None,
+                 query_id: str, cache: dict) -> dict:
+    """Judge one answer, reusing the cache when possible.
+
+    An abstention is scored 0 without any call: there is nothing to evaluate, and caching
+    it would freeze a non-judgement under a key a later run may want to fill.
+
+    Args:
+        question: The question asked.
+        gold: Ground truth answer.
+        pred: The model's answer, or None (abstention).
+        query_id: Cache key.
+        cache: Mutated in place with the new judgement.
+
+    Returns:
+        `{"score": 0 | 1, "reasoning": str}`.
+    """
+    if pred is None:
+        return {"score": 0, "reasoning": "abstention"}
+    if query_id in cache:
+        return cache[query_id]
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {"role": "user", "content": f"Question: {question}\n"
+                                        f"Ground truth answer: {gold}\n"
+                                        f"Model's answer: {pred}"},
+        ],
+    )
+    raw = (response.choices[0].message.content or "").strip()
+
+    # The judge is asked for a bare 0/1; anything else is kept verbatim in `reasoning` so a
+    # non-compliant judge is visible in the results instead of silently scoring 0.
+    match = _BINARY.search(raw)
+    result = {"score": int(match.group()) if match else 0, "reasoning": raw}
+    cache[query_id] = result
+    return result
+
+
+
+
+
+
+
+
+
+
+
+"""Phase 1 metrics — pure functions over strings and page numbers.
+
+No I/O, no fitz, no DOM knowledge: every input is a plain value supplied by the caller.
+page_recall owns the only index-convention boundary of the harness (agent 0-indexed vs
+dataset 1-indexed), so no other module ever holds a shifted page number.
+"""
+
+import re
+import unicodedata
+from collections import Counter
+
+# A comma is a thousands separator only when followed by EXACTLY three digits. Without the
+# (?!\d) guard this would also eat the European decimal comma in "2,5" -> "25", a factor 10
+# on a numeric answer, silent and scored as a model error.
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_ARTICLES = re.compile(r"\b(?:a|an|the)\b")
+_LEADING_CURRENCY = re.compile(r"^[$€£]\s*")
+_WHITESPACE = re.compile(r"\s+")
+_PERIPHERAL = " .,;:!?"
+
+
+def normalize_text(s: str | None) -> str:
+    """Canonical form of an answer for comparison.
+
+    NFKC (which also folds non-breaking and thin spaces, common in financial amounts),
+    casefold, thousands separators, percent and leading currency signs removed, peripheral
+    punctuation trimmed, isolated articles dropped, whitespace collapsed.
+
+    Deliberately NOT handled: scale equivalence ($2.5M vs 2,500,000), date formats, and
+    aliases (FY19 vs fiscal 2019). Those change what the benchmark measures.
+
+    Args:
+        s: Raw text, or None.
+
+    Returns:
+        The normalized text; "" when `s` is None.
+    """
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", s).casefold()
+    s = _THOUSANDS.sub("", s)
+    s = s.replace("%", "")
+    s = s.strip(_PERIPHERAL)
+    s = _LEADING_CURRENCY.sub("", s)
+    s = _ARTICLES.sub(" ", s)
+    return _WHITESPACE.sub(" ", s).strip()
+
+
+def token_f1(pred: str | None, gold: str) -> float:
+    """Token-level F1 between a prediction and the gold answer, after normalization.
+
+    Args:
+        pred: Predicted answer, or None (abstention).
+        gold: Gold answer.
+
+    Returns:
+        F1 in [0, 1]; 0.0 when either side normalizes to nothing.
+    """
+    pred_tokens = normalize_text(pred).split()
+    gold_tokens = normalize_text(gold).split()
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+
+    overlap = sum((Counter(pred_tokens) & Counter(gold_tokens)).values())
+    if not overlap:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def page_recall(pred_page: int | None, gold_pages: list[int]) -> float:
+    """1.0 when the cited page is one of the gold pages.
+
+    THE index boundary of the harness: `pred_page` is 0-indexed (agent and DOM convention),
+    `gold_pages` is 1-indexed (dataset convention), and the +1 is applied here and nowhere
+    else. An abstention scores 0.0 rather than being excluded: on this intra-doc oracle the
+    answer is always in the document, so not citing is a failure to locate — and excluding
+    it would reward abstaining on the hard queries.
+
+    Args:
+        pred_page: Page cited by the agent, 0-indexed, or None.
+        gold_pages: Gold pages, 1-indexed.
+
+    Returns:
+        1.0 or 0.0.
+    """
+    if pred_page is None:
+        return 0.0
+    return 1.0 if (pred_page + 1) in gold_pages else 0.0
+
+
+def test_metrics() -> None:
+    """Run the metric self-checks; raises AssertionError on the first failure."""
+    assert normalize_text(None) == ""
+    assert normalize_text("The United States.") == "united states"
+    assert normalize_text("$1,234,567") == "1234567"
+    assert normalize_text("2,5 million") == "2,5 million"   # decimal comma preserved
+    assert normalize_text("  12.5%  ") == "12.5"
+    print("OK: normalize_text")
+
+    assert token_f1("the united states", "United States") == 1.0
+    assert token_f1(None, "united states") == 0.0
+    assert token_f1("united states", "") == 0.0
+    assert token_f1("canada", "united states") == 0.0
+    assert 0.0 < token_f1("the united states of america", "united states") < 1.0
+    print("OK: token_f1")
+
+    assert page_recall(15, [16]) == 1.0          # 0-indexed 15 == 1-indexed 16
+    assert page_recall(16, [16]) == 0.0
+    assert page_recall(None, [16]) == 0.0
+    assert page_recall(156, [157, 158, 159]) == 1.0
+    print("OK: page_recall")
+
+
+
+
+
+
+
+
+"""Score the benchmark results: token F1, page recall, LLM judge.
+
+Reads eval/results_all.jsonl and writes eval/results_scored.jsonl with the metrics
+appended to each row. The judge calls are what the thread pool is for; the two other
+metrics are local computation.
+"""
+
+import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from tqdm import tqdm
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))          # eval/, for judges and metrics
+
+from judges import judge_answer, load_cache, save_cache   # noqa: E402
+from metrics import page_recall, token_f1                 # noqa: E402
+
+RESULTS_ALL = _HERE / "results_all.jsonl"
+RESULTS_SCORED = _HERE / "results_scored.jsonl"
+
+
+def score_results(input_path: Path = RESULTS_ALL, output_path: Path = RESULTS_SCORED) -> None:
+    """Score every result row and write them back with their metrics.
+
+    Args:
+        input_path: The concatenated results JSONL.
+        output_path: Destination JSONL, one scored row per line.
+    """
+    rows = [json.loads(line)
+            for line in input_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    cache = load_cache()
+
+    def score(row: dict) -> dict:
+        judgement = judge_answer(row["question"], row["gold_answer"], row["pred_answer"],
+                                 row["query_id"], cache)
+        return {
+            **row,
+            "token_f1": round(token_f1(row["pred_answer"], row["gold_answer"]), 4),
+            "page_recall": page_recall(row["pred_source_page"], row["gold_pages"]),
+            "judge_score": judgement["score"],
+            "judge_reasoning": judgement["reasoning"],
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        scored = list(tqdm(pool.map(score, rows), total=len(rows), unit="q"))
+
+    save_cache(cache)
+    with output_path.open("w", encoding="utf-8") as out:
+        for row in scored:
+            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"{len(scored)} lignes -> {output_path}")
