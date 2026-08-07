@@ -1,0 +1,89 @@
+import json, re, sys
+from pathlib import Path
+import pandas as pd
+
+sys.path.insert(0, "eval")
+
+rows = [json.loads(l) for l in
+        Path("eval/results_all.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+
+# agent_metrics aplati au niveau des colonnes (tokens reste un dict, rarement utile)
+df = pd.DataFrame([{**{k: v for k, v in r.items() if k != "agent_metrics"},
+                    **r.get("agent_metrics", {})} for r in rows])
+
+print("shape:", df.shape)
+print("colonnes:", df.columns.tolist())
+df.head()
+
+
+
+
+
+
+
+
+
+
+print("lignes             :", len(df))
+print("errors             :", df["error"].notna().sum())
+print("abstentions        :", df["pred_answer"].isna().sum())
+print("hit_max_iterations :", int(df["hit_max_iterations"].fillna(False).sum()))
+print()
+print("submit_draft_source:")
+print(df["submit_draft_source"].value_counts(dropna=False).to_string())
+print()
+for c in ["tool_calls_ok", "tool_call_in_content", "tool_call_malformed",
+          "both_channels", "no_tool_no_answer"]:
+    total = int(df[c].fillna(0).sum())
+    touched = int((df[c].fillna(0) > 0).sum())
+    print(f"{c:22s} total={total:5d}   queries touchées={touched:4d}")
+
+
+
+
+
+
+
+
+
+
+from collections import Counter
+
+FORMS = [("valid", r"^(s\d+|s_toc)$"), ("atom_id", r"^p\d+_e\d+$"), ("hybrid", r"^s\d+_e\d+$")]
+counts, bad_per_query, examples = Counter(), [], Counter()
+
+for calls in df["get_section_calls"]:
+    bad = 0
+    for cid in (calls if isinstance(calls, list) else []):
+        form = next((n for n, p in FORMS if cid and re.match(p, str(cid))), "other")
+        counts[form] += 1
+        if form != "valid":
+            bad += 1
+            examples[str(cid)] += 1
+    bad_per_query.append(bad)
+
+df["n_bad_ids"] = bad_per_query
+total = sum(counts.values())
+for form, n in counts.most_common():
+    print(f"{form:10s} {n:5d}  ({n / total:.1%})")
+print(f"\nqueries avec >=1 id invalide : {(df['n_bad_ids'] > 0).mean():.1%}")
+print("exemples:", examples.most_common(10))
+
+
+
+
+
+
+
+
+from metrics import page_recall
+
+df["page_recall"] = [page_recall(int(p) if pd.notna(p) else None, g)
+                     for p, g in zip(df["pred_source_page"], df["gold_pages"])]
+
+for label, sub in [("global", df),
+                   ("tool_calls_ok > 0", df[df["tool_calls_ok"].fillna(0) > 0]),
+                   ("aucun id invalide", df[df["n_bad_ids"] == 0]),
+                   (">=1 id invalide", df[df["n_bad_ids"] > 0])]:
+    if len(sub):
+        print(f"{label:20s} mean={sub['page_recall'].mean():.3f}  n={len(sub)}")
