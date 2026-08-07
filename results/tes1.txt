@@ -1,0 +1,80 @@
+import json, re, sys
+from collections import Counter
+from pathlib import Path
+import pandas as pd
+
+sys.path.insert(0, ".")
+from dom_tools import all_section_ids
+
+PROCESSED = Path("/home/datacamp/data/FinRAGBench-V/processed")
+
+rows = [json.loads(l) for l in
+        Path("eval/results_all.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+stems = sorted(p.parent.name for p in PROCESSED.glob("*/doc_dom.json"))
+
+_cache = {}
+def known_ids(query_id):
+    """Set des section_id réels du document, ou None si le DOM est introuvable."""
+    stem = next((s for s in stems if query_id.startswith(s + "_")), None)
+    if stem is None:
+        return None
+    if stem not in _cache:
+        dom = json.loads((PROCESSED / stem / "doc_dom.json").read_text(encoding="utf-8"))
+        _cache[stem] = all_section_ids(dom["tree"])
+    return _cache[stem]
+
+def form_of(cid):
+    cid = str(cid)
+    if re.fullmatch(r"s\d+|s_toc", cid):  return "section_shape"   # bien formé, inexistant
+    if re.fullmatch(r"p\d+_e\d+", cid):   return "atom_id"
+    if re.fullmatch(r"s\d+_e\d+", cid):   return "hybrid"
+    return "other"
+
+recs, forms, examples, recovery = [], Counter(), Counter(), Counter()
+for r in rows:
+    calls = (r.get("agent_metrics") or {}).get("get_section_calls") or []
+    known = known_ids(r["query_id"])
+    n_bad, first_bad = 0, None
+    if known is not None:
+        for i, cid in enumerate(calls):
+            if cid in known:
+                continue
+            n_bad += 1
+            forms[form_of(cid)] += 1
+            examples[str(cid)] += 1
+            if first_bad is None:
+                first_bad = i
+            nxt = calls[i + 1] if i + 1 < len(calls) else None
+            recovery[("no_next" if nxt is None else
+                      "recovered" if nxt in known else
+                      "same_id_again" if nxt == cid else "still_invalid")] += 1
+    recs.append({"query_id": r["query_id"],
+                 "dom_found": known is not None,
+                 "n_calls": len(calls),
+                 "n_invalid_section_ids": n_bad,
+                 "first_invalid_pos": first_bad,
+                 "submit_draft_source": (r.get("agent_metrics") or {}).get("submit_draft_source")})
+
+inv = pd.DataFrame(recs)
+ok = inv[inv["dom_found"]]
+
+print(f"lignes: {len(inv)}   DOM introuvable: {(~inv['dom_found']).sum()}")
+print(f"appels get_section total : {ok['n_calls'].sum()}")
+print(f"appels invalides         : {ok['n_invalid_section_ids'].sum()} "
+      f"({ok['n_invalid_section_ids'].sum() / max(ok['n_calls'].sum(), 1):.1%})")
+print(f"queries avec >=1 invalide: {(ok['n_invalid_section_ids'] > 0).mean():.1%}\n")
+
+print("formes des ids invalides:")
+for f, n in forms.most_common():
+    print(f"  {f:15s} {n:5d}  ({n / max(sum(forms.values()), 1):.1%})")
+
+print("\naprès un id invalide, l'appel suivant est:")
+for k, n in recovery.most_common():
+    print(f"  {k:15s} {n:5d}  ({n / max(sum(recovery.values()), 1):.1%})")
+
+print("\ntop ids invalides:", examples.most_common(10))
+print("\nposition du 1er id invalide:")
+print(ok["first_invalid_pos"].value_counts().sort_index().to_string())
+print("\nsubmit_draft_source selon présence d'ids invalides:")
+print(pd.crosstab(ok["n_invalid_section_ids"] > 0, ok["submit_draft_source"], normalize="index")
+        .round(3).to_string())
